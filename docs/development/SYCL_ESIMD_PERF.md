@@ -60,6 +60,17 @@ Model: dolphin3:latest 8B, Q4_K_M.
 | Standard SYCL (default `reorder_mul_mat_vec_q6_k_q8_1_sycl`) | 519 | 16.47 | 1.00× |
 | **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 499 | 6.59 | 0.40× |
 
+### Q5_K (TinyLlama 1.1B Q5_K_M)
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `mul_mat_vec_q5_K_q8_1_sycl`) | 1168 | 21.80 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 1169 | 18.78 | 0.86× |
+
+Q5_K reads from the standard `block_q5_K` layout (no reorder layout
+exists in the ggml-sycl tree), which keeps the change surface small
+but means it can't share Q4_K's cross-block contiguous prefetch.
+
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
 
