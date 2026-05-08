@@ -81,17 +81,52 @@ ceiling from generic C++; an explicit-SIMD code path can.
 This branch adds that path so the gap is closeable in upstream over time
 instead of staying frozen behind a binary blob.
 
-## Math correctness
+## Math correctness — FP-precision-class drift, NOT bit-identical
 
-The ESIMD kernel produces token-for-token identical output to the
-standard SYCL kernel on 30+ token completions across multiple seeds and
-prompts, at temperature 0. Verified by isolated `llama-cli` diff with
-the IPEX-LLM container paused (so the standard kernel has the iGPU
-exclusively).
+**The ESIMD kernels are numerically equivalent to the standard SYCL
+kernels at FP-precision-class drift, NOT bit-identical.** At
+temperature 0 with deterministic seeds, the two paths' generations
+diverge in ~30-token windows on some prompts.
 
-Don't trust this — verify on your own hardware before using ESIMD path
-in any pipeline that cares about output. The runtime env-var gate makes
-A/B comparison trivial.
+The drift is structural to ESIMD vs. standard SYCL: explicit-SIMD
+reductions sum partial dot products in a different order than the
+subgroup-cooperative reductions in the standard SYCL kernel. FP
+addition is non-associative — `(a+b)+c ≠ a+(b+c)` for floats — so
+reduction-order changes produce small rounding-class differences in
+the per-row dot products. Most tokens are unaffected (logit gaps are
+large), but on tokens where two top-logit candidates are close, the
+small ESIMD drift can flip argmax. Once one token diverges, the rest
+of the generation cascades.
+
+This is the **same class of behavior** you'd see comparing CUBLAS-FP16
+vs. CPU-FP32 inference, or two different llama.cpp backends (e.g.
+SYCL vs. CUDA) on the same model. It is not unique to ESIMD; it is
+unique to "different reduction ordering."
+
+**What this means in practice:**
+- Greedy generations *will eventually diverge* between ESIMD and
+  standard SYCL on long sequences. They may converge again or stay
+  divergent.
+- Logits are within FP32 noise of each other per token; downstream
+  metrics (perplexity, eval scores) are expected to be statistically
+  indistinguishable. **This has not yet been measured on this branch
+  — please run a perplexity test on your eval set before deploying.**
+- For sampling at temperature > 0, the drift is invisible (sampling
+  noise dominates).
+
+**Observed during development:** the iter-16 ESIMD kernel by itself
+produces token-for-token identical output to the standard SYCL kernel
+on the test prompt. Adding sibling ESIMD kernels (Q4_0, Q6_K) to the
+same `libggml-sycl.so` shifts icpx's reg allocation / instruction
+scheduling for the Q4_K kernel just enough to change reduction order,
+which produces the divergence. The Q4_K kernel **source** is byte-
+identical between the two builds; the **compiled binary** differs at
+the FP-precision level.
+
+**Verify on your own hardware** before using the ESIMD path in any
+pipeline that cares about exact output. The runtime env-var gate makes
+A/B comparison trivial. If your workload is generation-quality-sensitive
+beyond what perplexity tests catch, stay on the standard SYCL path.
 
 ## Scope
 
