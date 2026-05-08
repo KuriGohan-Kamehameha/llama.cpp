@@ -49,12 +49,13 @@ namespace esimd = sycl::ext::intel::esimd;
 // pressure). Other Intel iGPU/dGPU classes may have different optima;
 // this is a tuning knob.
 //
-// IPEX-LLM IR analysis (2026-05-08) shows IPEX uses ROWS=16 + NSG=8 +
-// SLM-cooperative activation broadcast — their per-thread weight footprint
-// is 4× ours, but they free the GRF that would be needed for activation by
-// cooperatively staging it through SLM. See SYCL_ESIMD_LOG.md "iter 19"
-// for the implementation roadmap. Until that lands, ROWS=4 is the local
-// max for this all-in-GRF architecture.
+// IPEX-LLM Q4_K kernel SPIR-V comparison (2026-05-08) shows the perf
+// gap is NOT a missing non-public intrinsic. Both kernels use only
+// `rdregion`/`wrregion` genx ops (no DPAS, no LSC hints, no SLM, no
+// subgroup ops, sub_group_size=1 same as ours). IPEX's win is
+// algorithmic: FP-domain inner loop (convert weights to FP32, fmul,
+// FP16 accumulate) instead of our INT8 mul -> INT16 -> reduce -> FP
+// scale. See SYCL_ESIMD_LOG.md "iter 19" for the FP-domain rewrite plan.
 constexpr int ROWS_PER_THREAD = 4;
 
 template <int VEC_W>
