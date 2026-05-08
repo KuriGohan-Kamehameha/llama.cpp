@@ -42,9 +42,25 @@ Model: dolphin3:latest 8B, Q4_K_M.
 
 | backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
 |---|--:|--:|--:|
-| Standard SYCL (default `reorder_mul_mat_vec_q4_k_q8_1_sycl`) | 489 ± 0.4 | 11.67 ± 0.18 | 1.00× |
+| Standard SYCL (default `reorder_mul_mat_vec_q4_k_q8_1_sycl`) | 482 ± 8.6 | 11.64 ± 0.04 | 1.00× |
 | **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 486 ± 0.4 | **6.41 ± 0.01** | 0.55× |
 | IPEX-LLM bundled (proprietary container) | 497 | 17.6 | 1.51× |
+
+Three independent post-iter-16 interventions were tested empirically
+and all failed to move past the 6.4 t/s ceiling on Xe-LPG iGPU
+(see `SYCL_ESIMD_LOG.md`):
+- Iter 17 (qs prefetch with cache hints): no gain in multi-kernel build.
+- Iter 18 (ROWS_PER_THREAD=2): -21% regression — shared-activation
+  amortization is the dominant factor.
+- Iter 19 (FP-domain inner loop, mirroring IPEX SPIR-V): -1.6% wash —
+  the INT vs FP compute-domain choice doesn't matter at these vector
+  widths on Xe-LPG XVE. Falsified the SPIR-V analysis hypothesis.
+
+The fork's iter-16 architecture is the practical ESIMD ceiling for
+mat-vec on Xe-LPG iGPU at the per-quant kernel level. Closing the
+remaining gap to vanilla (and to IPEX) requires multi-week structural
+work — different work-group shape with SLM staging, fused-op kernels,
+or compiler-level investigation — outside this fork's scope.
 
 ### Q4_0 (TinyLlama 1.1B)
 
