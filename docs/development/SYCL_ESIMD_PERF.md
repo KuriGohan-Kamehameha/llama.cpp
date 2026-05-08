@@ -53,21 +53,27 @@ Model: dolphin3:latest 8B, Q4_K_M.
 | **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 486 ± 0.4 | **6.41 ± 0.01** | 0.55× |
 | IPEX-LLM bundled (proprietary container) | 497 | 17.6 | 1.51× |
 
-Three independent post-iter-16 interventions were tested empirically
-and all failed to move past the 6.4 t/s ceiling on Xe-LPG iGPU
-(see `SYCL_ESIMD_LOG.md`):
-- Iter 17 (qs prefetch with cache hints): no gain in multi-kernel build.
-- Iter 18 (ROWS_PER_THREAD=2): -21% regression — shared-activation
-  amortization is the dominant factor.
-- Iter 19 (FP-domain inner loop, mirroring IPEX SPIR-V): -1.6% wash —
-  the INT vs FP compute-domain choice doesn't matter at these vector
-  widths on Xe-LPG XVE. Falsified the SPIR-V analysis hypothesis.
+**Six independent post-iter-16 interventions** were tested empirically
+across Phase B-7 + Phase E, and all failed to move past the 6.4 t/s
+ceiling on Xe-LPG iGPU (see `SYCL_ESIMD_LOG.md` for the full ledger):
 
-The fork's iter-16 architecture is the practical ESIMD ceiling for
-mat-vec on Xe-LPG iGPU at the per-quant kernel level. Closing the
-remaining gap to vanilla (and to IPEX) requires multi-week structural
-work — different work-group shape with SLM staging, fused-op kernels,
-or compiler-level investigation — outside this fork's scope.
+- Iter 17 (qs prefetch with cache hints): 0% (register live-range
+  overhead cancelled the latency-hiding gain).
+- Iter 18 (ROWS_PER_THREAD=2): -21% (lost shared-activation amortization).
+- Iter 19 (FP32-domain inner loop, mirroring IPEX SPIR-V): -1.6% wash.
+- Iter 20 (SLM-cooperative activation + ROWS=8): -14% (SLM round-trip
+  + barrier dominate; per-row weight state remains the binding GRF
+  constraint, not the activation).
+- Iter 21 (FP16 MAC): -37% (int8→half lane conv + FP32-widened reduce
+  exceed any int-pipe→FP-pipe routing gain).
+
+The fork's iter-16 architecture is the **empirically settled** ESIMD
+ceiling for mat-vec on Xe-LPG iGPU at the source-level kernel design.
+The remaining gap to vanilla and IPEX is not closable through
+arithmetic-format or per-thread parallelism-shape swaps within this
+kernel architecture. If breakthrough exists, it lives in compiler/IGC
+scheduling parameters that differ between icpx and IPEX's toolchain —
+outside source-level control without IGC dump access.
 
 ### Q4_0 (TinyLlama 1.1B)
 
