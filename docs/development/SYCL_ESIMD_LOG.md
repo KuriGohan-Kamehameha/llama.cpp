@@ -1141,3 +1141,88 @@ FP16 throughput on Xe-LPG XVE beats int8 throughput.
 
 If iter-21 also lands within ±5% of iter-16, the structural ceiling
 on this hardware class is settled.
+
+## 2026-05-08T22:35:00Z  Iter 21 — FP16 MAC: FALSIFIED. Structural ceiling final.
+
+Implemented `simd<half, 64>` mul + `esimd::reduce<float>` (FP32-widened
+accumulator to avoid FP16 sum overflow) variant of iter-16. Same
+architecture (ROWS=4, WG=32, GRF activation), only the inner mul/reduce
+swapped from int8/int16 to half/float. Built in a separate `.so`
+(`/home/p/build/llama-iter21/`) to avoid the kernel cohabitation
+interference documented in iter-20.
+
+Bench (paired r=8, dolphin3 8B Q4_K_M, branch-0 IPEX-runner contention
+~12% on vanilla, paired comparison still valid):
+
+| build | tg128 t/s | wall-clock for r=8 |
+|--|--:|--:|
+| Vanilla | 10.44 ± 0.19 | reference |
+| ESIMD iter-16 | 4.76 ± 0.87 | <2 min |
+| **ESIMD iter-21 (FP16 MAC)** | **2.98 ± 1.61** | >5 min |
+
+**iter-21 is 0.63× of iter-16 throughput. REGRESSION.** Wall-clock
+verifies the 2.5× slowdown is real, not bench noise.
+
+The hypothesis that Xe-LPG XVE FP16 multiply throughput would beat
+int8 multiply throughput is falsified. Cost mechanism: int8→half lane
+conversions + the FP32-widened reduce (required to avoid FP16 sum
+overflow on 32-element terms with magnitude 1905) cost more than the
+int-pipe→FP-pipe routing saves.
+
+### Six-iteration empirical pattern — STRUCTURAL CEILING FINAL
+
+| iter | intervention | Δ vs iter-16 | mechanism that absorbed the change |
+|--|--|--:|--|
+| 17 | qs prefetch with cache hints | 0% | register live-range overhead cancelled latency hide |
+| 18 | ROWS_PER_THREAD=2 | -21% | lost shared-activation amortization |
+| 19 | FP32 inner loop (mirror IPEX SPIR-V) | -1.6% | int8→fp32 convert overhead = FP-pipe gain |
+| 19' | RPT=16 / WG=8 SLM (SPIR-V-misread hypothesis) | not landed | refuted by re-reading SPIR-V |
+| 20 | SLM-coop ROWS=8 | -14% | SLM round-trip + barrier dominate, weight-state GRF still bound |
+| 21 | FP16 MAC (this) | -37% | int8→half lane conv + FP32-widened reduce > int-pipe cost |
+
+Six interventions, six failures. The remaining gap from iter-16 to
+vanilla (0.55× → 1.0×) and to IPEX-LLM (0.55× → 1.51×) is **not
+closable through arithmetic-format or per-thread parallelism-shape
+swaps within this kernel architecture** on Xe-LPG iGPU.
+
+### Where the gap actually lives (informed conjecture, not yet tested)
+
+If breakthrough is ever to come from this corner, it would have to
+match IPEX's full algorithmic stack end-to-end, not a single-knob
+swap. Specifically:
+- Their kernel runs sub_group_size=1 (verified) with ROWS=1 (verified
+  via SPIR-V kernel signature `<f, 2, 1, 32, 1, 64, false, false>`).
+- Their FP-domain inner loop with `<256 x i8>` activation pre-dequantized
+  to `<512 x half>` once-per-super-block + per-sub-block FP fmul + FP16
+  accumulator (verified).
+- Their `align 4` weight loads (verified, ours is `align 1` from
+  `simd<uint8,128>::copy_from`).
+- And — the open variable — their **post-link / Level-Zero / IGC
+  scheduling parameters**, which we have no visibility into without
+  IGC dump or tighter compiler-flag instrumentation.
+
+Iter-19 tested points 1+2+3 (sub_group_size=1 already, FP-domain
+inner loop, `align 4` annotation) and landed at -1.6% wash. If IPEX's
+17.6 t/s really does come from only the surface-visible source-level
+choices we've replicated, our codegen must differ significantly — which
+points the remaining gap at icpx vs IPEX's compiler toolchain
+configuration. That's outside source-level control.
+
+### Phase E close-out: final
+
+The fork's iter-16 architecture is the practical ESIMD ceiling for
+mat-vec on Xe-LPG iGPU at the source-level kernel design. Closing
+the remaining gap requires either:
+(a) compiler/IGC investigation of icpx scheduling parameters that
+    differ from IPEX's toolchain (multi-week, off the source path);
+(b) elsewhere in the SYCL backend stack (mmq, fattn, larger-N matmul)
+    where ESIMD's pipe-routing has more headroom;
+(c) accept the ceiling and revisit on next-gen Xe-HPG hardware
+    (DPAS-capable, different architectural tradeoffs).
+
+Recommend the public fork ship as-is at iter-16: ESIMD code path
+opens, all 5 quants wired, perplexity verified bit-identical on Q4_K,
+six documented dead ends across the catalog so future contributors
+don't re-discover them.
+
+**End of Phase E.**
