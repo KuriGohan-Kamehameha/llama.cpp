@@ -38,11 +38,20 @@ Arc Xe-LPG, GPU PCI ID `0x7d51`), Ubuntu 24.04, oneAPI 2026.0.
 
 Model: dolphin3:latest 8B, Q4_K_M.
 
+### Q4_K_M (dolphin3:latest 8B)
+
 | backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
 |---|--:|--:|--:|
 | Standard SYCL (default `reorder_mul_mat_vec_q4_k_q8_1_sycl`) | 477 | 11.14 | 1.00× |
 | **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 477 | **6.41** | 0.58× |
-| IPEX-LLM bundled (`intelanalytics/ipex-llm-inference-cpp-xpu` container, proprietary) | 497 | 17.6 | 1.58× |
+| IPEX-LLM bundled (proprietary container) | 497 | 17.6 | 1.58× |
+
+### Q4_0 (TinyLlama 1.1B)
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `reorder_mul_mat_vec_q4_0_q8_1_sycl`) | 388 | 15.71 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 312 | 5.03 | 0.32× |
 
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
