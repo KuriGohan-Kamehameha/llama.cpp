@@ -53,6 +53,13 @@ Model: dolphin3:latest 8B, Q4_K_M.
 | Standard SYCL (default `reorder_mul_mat_vec_q4_0_q8_1_sycl`) | 388 | 15.71 | 1.00× |
 | **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 312 | 5.03 | 0.32× |
 
+### Q6_K (TinyLlama 1.1B Q6_K)
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `reorder_mul_mat_vec_q6_k_q8_1_sycl`) | 519 | 16.47 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 499 | 6.59 | 0.40× |
+
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
 
