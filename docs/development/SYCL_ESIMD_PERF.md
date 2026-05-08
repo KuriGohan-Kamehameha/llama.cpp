@@ -42,9 +42,9 @@ Model: dolphin3:latest 8B, Q4_K_M.
 
 | backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
 |---|--:|--:|--:|
-| Standard SYCL (default `reorder_mul_mat_vec_q4_k_q8_1_sycl`) | 477 | 11.14 | 1.00× |
-| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 477 | **6.41** | 0.58× |
-| IPEX-LLM bundled (proprietary container) | 497 | 17.6 | 1.58× |
+| Standard SYCL (default `reorder_mul_mat_vec_q4_k_q8_1_sycl`) | 489 ± 0.4 | 11.67 ± 0.18 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 486 ± 0.4 | **6.41 ± 0.01** | 0.55× |
+| IPEX-LLM bundled (proprietary container) | 497 | 17.6 | 1.51× |
 
 ### Q4_0 (TinyLlama 1.1B)
 

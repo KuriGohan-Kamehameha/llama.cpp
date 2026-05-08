@@ -576,3 +576,45 @@ re-investigation.
 
 **Phase B-6 prefetch investigation and Phase C Q6_K port** in flight at
 time of writing.
+
+## 2026-05-08T18:35:00Z  Iter 17 — qs-only prefetch: dead-end on the canonical fork build
+
+Tried `esimd::prefetch<uint32_t, 32>` for next-super-block qs (per-row,
+ROWS_PER_THREAD=4) at the top of each Q4_K super-block iteration, with
+L1+L2 cached hints. V2 qs-only (skip 12 B scales + shared 256 B
+activation, both already in L1).
+
+In a Q4_K-only worktree (no sibling kernels): +20.5% gain reported
+by subagent (~6.35 → ~7.65 t/s tg128).
+
+**On the canonical 5-kernel + prefetch fork build** (paired -r 5,
+dolphin3 8B Q4_K_M, ASUS NUC, Arc Xe-LPG):
+
+| build | tg128 t/s |
+|--|--:|
+| ESIMD iter-16 (un-prefetched) | 6.41 ± 0.01 |
+| ESIMD iter-16 + prefetch | 6.41 ± 0.01 |
+| Vanilla | 11.67 ± 0.18 |
+
+**No gain.** Within stddev. The prefetch's latency-hiding effect is
+fully cancelled by the extra register live-range overhead it
+introduces (prefetch addresses + cache-hint property objects). With
+sibling Q4_0/Q5_K/Q6_K/Q8_0 ESIMD kernels in the same `libggml-sycl.so`,
+icpx is already at register-pressure ceiling for Q4_K (this is the
+same compiler-allocation interaction documented in the FP-precision-
+class drift section of `SYCL_ESIMD_PERF.md`). Adding 24 more lines
+of GRF state to the kernel doesn't free the latency that prefetch
+was meant to hide.
+
+**Reverted in commit `cd9557e`.** If a future kernel-set-only
+configuration ever lands (e.g., a build option to compile only Q4_K
+ESIMD, leaving Q4_0/Q5_K/Q6_K/Q8_0 on the standard SYCL path), this
+prefetch is worth re-introducing under that build flag — the
+in-isolation gain is real, just doesn't transfer.
+
+**Recommendation: do not re-introduce prefetch into the multi-kernel
+path until register pressure is reduced via other means** (e.g.,
+splitting per-row work across subgroup lanes, moving shared activation
+to SLM, or using `esimd::lsc_load`). Pursue those interventions first;
+prefetch becomes valuable again once the GRF is no longer fully
+spoken for.
