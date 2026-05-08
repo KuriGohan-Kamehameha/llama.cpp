@@ -965,3 +965,36 @@ gains require multi-week structural work (SLM cooperation with
 fundamentally different parallelism shape, fused ops, compiler-level
 investigation) that's outside the "land an opt-in ESIMD code path"
 scope of this fork.
+
+## 2026-05-08T20:15:00Z  Static audit pass on all 5 ESIMD kernels
+
+Math review of `mmvq_esimd.cpp` covering all 5 quants (Q4_K, Q4_0, Q5_K,
+Q6_K, Q8_0). Audit checks: per-block math equivalence to vanilla
+`vec_dot_q*_q8_1` impls, integer overflow on int8*int8 → int16
+multiplies and 32-element reduces, bit-mask correctness for nibble
+unpack and qh high-bit extraction, region pointer arithmetic against
+the reorder layouts in `ggml-sycl/quants.hpp`, dispatch-wrapper
+divisibility asserts.
+
+| quant | math | overflow | masks | bounds | verdict |
+|---|---|---|---|---|---|
+| Q4_K | unsigned 4-bit nibble × q8_1 with 6-bit sub-scales/sub-mins | int16: 15×127=1905, reduce<int> 32×=60960 | `(qs >> 4) & 0x0F`, scales[12] high-bit reconstruction OK | reorder offsets `qs|scales|dm` per `block_q_t<Q4_K>` | PASS |
+| Q4_0 | unsigned 4-bit nibble - 8 offset factored into `d*(sumi*dy - 8*sy)` contrib formula (kernel uses raw nibble, not weight) | int16: 15×127=1905, reduce 32×=60960 | low/high nibble unpack + `-8` offset via formula | 8-block grouping, divisibility asserted | PASS |
+| Q5_K | unsigned 5-bit (low4 from qs, high1 from qh bit s) with same scales[12] encoding as Q4_K | int16: 31×127=3937, reduce 32×=125984 | qh high-bit `((qh >> s) & 1) << 4` per sub-block | standard `block_q5_K` layout (no reorder) | PASS |
+| Q6_K | unsigned 6-bit (4 low + 2 high) - 32 offset, then per-half-of-128 chunked into A/B/C/D | int16: 32×128=4096, reduce 16×=65536 (close to int32 max but safe) | 4 different qh masks `(qh<<4)&0x30`, `(qh<<2)&0x30`, `qh&0x30`, `(qh>>2)&0x30` all verified against `((qh>>N)&3)<<4` | reorder offsets `ql|qh|scales|d` | PASS |
+| Q8_0 | signed int8 weight × signed int8 activation, no offset | int16: 128×128=16384 (fits), reduce 32×=524288 | no masks (raw int8) | reorder offsets `qs|d`, 8-block grouping asserted | PASS |
+
+**Cross-kernel checks:** dst[row] write is per-row (no race), early-return
+on `row_base >= nrows`, inner-loop `if (row >= nrows) break` correctly
+handles non-divisible nrows, copy_from alignment is 1-byte default
+(safe for any address), reduce<int> returns int (32-bit, no overflow at
+these magnitudes).
+
+**Coverage caveat:** only Q4_K has formal perplexity verification
+(commit `1a3014f`, bit-identical 9.5668 across 5 paired runs on
+wikitext-2 25.6K tokens). Q4_0 / Q5_K / Q6_K / Q8_0 have only
+correctness-by-paired-llama-cli (output matches vanilla on the first
+~14 tokens then drifts in the documented FP-precision-class window).
+A full perplexity gate per quant is a follow-up if a downstream user
+needs it; the math audit gives high confidence the math is right and
+the FP drift class is the only divergence source.
