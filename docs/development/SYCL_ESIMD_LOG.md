@@ -896,3 +896,72 @@ opener (Q4_K-style FP-domain rewrite for the other 4 quants).
 If iter-19 doesn't move the needle, the ceiling conclusion holds more
 strongly than before — we'd have empirically tested the most plausible
 remaining hypothesis.
+
+## 2026-05-08T20:25:00Z  Iter 19 — FP-domain inner loop: FALSIFIED
+
+Implemented the FP-domain rewrite from the SPIR-V comparison: convert
+weights to FP32, fmul × FP32-converted activations, FP-reduce per sub-block.
+Two variants tested.
+
+Bench (paired -r 5, dolphin3 8B Q4_K_M, ASUS NUC, Arc Xe-LPG):
+
+| build | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla | 11.64 ± 0.04 | 482.13 ± 8.63 |
+| iter-16 INT-domain (canonical) | 6.41 ± 0.01 | 485.94 ± 0.39 |
+| **iter-19 FP-domain pair-stride** | **6.31 ± 0.11** | 477.49 ± 6.98 |
+| iter-19 FP-domain 8-iter (textbook IPEX shape) | 5.76 ± 1.31 | 486.90 ± 0.28 |
+
+Pair-stride FP variant: -1.6% from iter-16 (wash, within stddev).
+8-iter FP variant: -10% with high variance (register pressure from larger-element reduce footprint).
+
+**The FP-domain hypothesis from the SPIR-V comparison is empirically
+falsified.** Both INT and FP inner loops hit the same ~6.4 t/s wall.
+The 2.7× IPEX advantage is **not explained by INT→FP domain alone.**
+
+### What this tells us about the perf gap mechanism
+
+The "FP pipe vs INT pipe" mental model that motivated iter-19 didn't
+predict the actual cost on Xe-LPG. Plausible reasons:
+
+1. The int8→FP32 convert of 256 activation elements once per super-block
+   isn't free; the int multiply was already cheap on Xe-LPG's int pipe.
+2. Xe-LPG XVE doesn't have a wide FP32-multiply advantage over int8/int16
+   multiply for these vector widths; both paths retire at similar rates.
+3. The 4× larger weight-vector register footprint (int8→float32) costs
+   more in L1$/GRF than any FP-pipe advantage gains.
+
+### Phase B-7 close-out — strengthened
+
+Iter-16's "this is the ESIMD ceiling on Xe-LPG iGPU" conclusion now
+stands more strongly. We've empirically tested:
+- iter-17 (qs prefetch): no gain in canonical multi-kernel build.
+- iter-18 (ROWS_PER_THREAD=2): -21% regression (shared-activation
+  amortization is dominant).
+- iter-19 (FP-domain inner loop): -1.6% wash (compute-domain choice
+  doesn't matter at these vector widths on Xe-LPG XVE).
+
+**Three independent intervention attempts have all failed to move past
+6.4 t/s** on the iter-16 parallelism shape. The IPEX-LLM 17.6 t/s
+advantage must come from something **outside** the per-quant inner
+kernel — most likely:
+- Different work-group dispatch shape (multi-row-cooperative beyond
+  what GRF can hold per thread, requiring SLM staging).
+- Fused-op kernels (mat-vec + neighboring op).
+- Different compiler / GRF scheduling parameters (icpx vs whatever
+  IPEX builds with).
+
+The remaining unexplored intervention with bounded scope is
+**half-precision (FP16) inner loop** — `simd<half, 64>` mul + reduce.
+FP16 throughput is higher than FP32 on Xe-LPG XVE, halves register
+footprint vs FP32. Worth one experiment if a future maintainer wants
+to verify. Expected: similar to iter-19 but half the GRF cost.
+
+### End of Phase B-7 (final)
+
+The fork's iter-16 architecture is the practical ESIMD ceiling for
+mat-vec on Xe-LPG iGPU at the per-quant kernel level. Further per-quant
+gains require multi-week structural work (SLM cooperation with
+fundamentally different parallelism shape, fused ops, compiler-level
+investigation) that's outside the "land an opt-in ESIMD code path"
+scope of this fork.
