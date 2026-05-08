@@ -998,3 +998,68 @@ correctness-by-paired-llama-cli (output matches vanilla on the first
 A full perplexity gate per quant is a follow-up if a downstream user
 needs it; the math audit gives high confidence the math is right and
 the FP drift class is the only divergence source.
+
+## 2026-05-08T20:30:00Z  Contributor onboarding — what's left
+
+For anyone picking up this fork to extend coverage or close the IPEX
+gap, here's a concrete next-step ranking.
+
+### Coverage extension (in priority order)
+
+The existing 5 kernels (Q4_K / Q4_0 / Q5_K / Q6_K / Q8_0) cover the
+Piranesi roster. Llama.cpp ships several other K-quants and legacy
+quants that aren't yet wired up:
+
+| quant | block layout | est. effort | analog kernel |
+|---|---|--:|---|
+| **Q3_K** | `hmask[32]\|qs[64]\|scales[12]\|d` (110 B) — 3-bit signed (low2 from qs, high1 from hmask, -4 offset) | 1 day | mix of Q5_K (qh bit-extract) + Q6_K (signed offset) |
+| **Q2_K** | `scales[16]\|qs[64]\|dm[2]` (84 B) — 2-bit unsigned, 16 sub-blocks of 16 weights, no super-min | 1 day | Q4_K-shaped but smaller sub-blocks, simpler scale unpack |
+| **Q4_1** | `dm[4]\|qs[16]` (20 B) — same nibble layout as Q4_0 but with min/dmin | 0.5 day | Q4_0 + Q4_K's min term |
+| **Q5_0** | `dm[2]\|qh[4]\|qs[16]` (22 B) — same as Q5_K but no super-block | 0.5 day | Q5_K shape without the K-block scales[12] |
+| **Q5_1** | `dm[4]\|qh[4]\|qs[16]` (24 B) — Q5_0 + dmin like Q4_1 | 0.5 day | Q5_0 + min term from Q4_1 |
+
+Each follows the `mmvq_esimd.cpp` pattern: ROWS_PER_THREAD=4, WG=32,
+shared-activation across rows, `simd<int8,64>` packed pair multiply.
+Add the kernel + wrapper after the 5 existing ones, wire dispatch in
+`mmvq.cpp` under the existing `#ifdef GGML_SYCL_ESIMD` env-var-gated
+pattern, smoke-test with paired `llama-bench -r 5` + paired
+`llama-cli` photosynthesis-prompt completion.
+
+### Perf-gap closure (Q4_K — multi-week)
+
+Phase B-7 closed Q4_K mat-vec at 6.41 t/s on dolphin3 8B Q4_K_M
+(0.55× vanilla). Three iter-17/18/19 interventions all failed at the
+per-quant kernel level. Closing the remaining gap requires structural
+work:
+
+1. **Fused multi-op kernels.** `build_qkv` already supports `wqkv`
+   tensors; load-time concat of separate `wq/wk/wv` for llama-arch
+   models would save ~64 of 96 attn mat-vec dispatches per token.
+   Estimated ~10-15% wall-time gain, independent of ESIMD. ~4 days.
+2. **Cross-paradigm hybrid.** ESIMD inner multiply + SYCL
+   subgroup-cooperative reduce. Brings ESIMD's vector width together
+   with vanilla's per-row 16-thread cooperation. Multi-week.
+3. **IPEX kernel-shape match.** ROWS=16, NSG=8, runtime variant pick.
+   The user's IPEX SPIR-V drill-down (commit 5fa6c59) confirmed IPEX
+   uses no non-public intrinsics. The 2.7× advantage must come from
+   instruction scheduling / register allocation / dispatch shape that
+   the IR alone doesn't reveal. Multi-week reverse-engineering.
+
+### Correctness coverage
+
+Only Q4_K has formal perplexity verification (`1a3014f`,
+9.5668 ± 0.24125 across 5 paired runs on wikitext-2 25.6K tokens,
+bit-identical to vanilla at printed precision). The other 4 quants
+have static math audit (commit `3d9162d`) + paired `llama-cli`
+correctness-by-eyeball. A perplexity gate per quant is a 30-minute
+job per quant once a pipeline is set up; recommended before any user
+deploys this on a workload that's generation-quality-sensitive.
+
+### Phase D (upstream PR)
+
+`AGENTS.md` prohibits AI-authored upstream PRs. This work has been
+substantially AI-assisted. Upstreaming requires a human contributor
+who owns the kernel deeply, can debug it without AI assistance, and
+will engage with reviewers in their own voice. Until then the fork
+is the canonical channel; downstream users (e.g. Aimee on a NUC
+class machine) can apply this branch directly.
