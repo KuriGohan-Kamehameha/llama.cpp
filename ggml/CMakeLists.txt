@@ -250,6 +250,7 @@ option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl ca
 option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
 option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
+option(GGML_SYCL_ESIMD                      "ggml: build experimental Intel-ESIMD kernels (Intel iGPU/dGPU only; opt-in at runtime via GGML_SYCL_USE_ESIMD=1)" OFF)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING

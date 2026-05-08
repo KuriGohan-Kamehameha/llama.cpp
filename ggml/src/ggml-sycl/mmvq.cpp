@@ -5,6 +5,10 @@
 #include "quants.hpp"
 #include "vecdotq.hpp"
 
+#ifdef GGML_SYCL_ESIMD
+#include <cstdlib>  // std::getenv for runtime ESIMD switch
+#endif
+
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
                                   const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
@@ -1137,8 +1141,21 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q4_K:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl\n");
-                    reorder_mul_mat_vec_q4_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+#ifdef GGML_SYCL_ESIMD
+                    static const bool use_esimd =
+                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
+                    if (use_esimd) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl_esimd\n");
+                        extern void reorder_mul_mat_vec_q4_k_q8_1_sycl_esimd(
+                            const void *, const void *, float *, int, int, dpct::queue_ptr);
+                        reorder_mul_mat_vec_q4_k_q8_1_sycl_esimd(
+                            src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    } else
+#endif
+                    {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl\n");
+                        reorder_mul_mat_vec_q4_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    }
                 } else {
                     GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_K_q8_1_sycl\n");
                     mul_mat_vec_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);

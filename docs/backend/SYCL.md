@@ -720,6 +720,7 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 | GGML_SYCL_GRAPH    | OFF *(default)* \|ON *(Optional)*     | Enable build with [SYCL Graph extension](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc). |
 | GGML_SYCL_DNN      | ON *(default)* \|OFF *(Optional)*     | Enable build with oneDNN.                   |
 | GGML_SYCL_HOST_MEM_FALLBACK | ON *(default)* \|OFF *(Optional)* | Allow host memory fallback when device memory is full during quantized weight reorder. Enables inference to continue at reduced speed (reading over PCIe) instead of failing. Requires Linux kernel 6.8+. |
+| GGML_SYCL_ESIMD    | OFF *(default)* \|ON *(experimental, Intel-only)* | Build experimental Intel ESIMD (Explicit SIMD) kernels alongside the standard SYCL ones. Currently provides an alternative `reorder_mul_mat_vec_q4_K` kernel. Opt-in at runtime via `GGML_SYCL_USE_ESIMD=1` env var (default keeps the standard SYCL path). Foundation for closing the perf gap to Intel's binary-only IPEX-LLM kernels on Intel iGPU/dGPU. |
 | CMAKE_C_COMPILER   | `icx` *(Linux)*, `icx/cl` *(Windows)* | Set `icx` compiler for SYCL code path.      |
 | CMAKE_CXX_COMPILER | `icpx` *(Linux)*, `icx` *(Windows)*   | Set `icpx/icx` compiler for SYCL code path. |
 
@@ -736,6 +737,7 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 | GGML_SYCL_DISABLE_DNN | 0 (default) or 1 | Disable running computations through oneDNN and always use oneMKL. |
 | ZES_ENABLE_SYSMAN | 0 (default) or 1 | Support to get free memory of GPU by sycl::aspect::ext_intel_free_memory.<br>Recommended to use when --split-mode = layer |
 | UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS | 0 (default) or 1 | Support malloc device memory more than 4GB.|
+| GGML_SYCL_USE_ESIMD | unset (default) or any value | If `GGML_SYCL_ESIMD=ON` was used at build time, dispatching `reorder_mul_mat_vec_q4_K` to the experimental ESIMD kernel. Default keeps the standard SYCL path. |
 
 ## Design Rule
 

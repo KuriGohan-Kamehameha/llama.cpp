@@ -159,6 +159,11 @@ if (GGML_SYCL_HOST_MEM_FALLBACK)
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_HOST_MEM_FALLBACK)
 endif()
 
+if (GGML_SYCL_ESIMD)
+    message(STATUS "GGML_SYCL_ESIMD: building experimental Intel ESIMD kernels (opt-in via GGML_SYCL_USE_ESIMD=1)")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_ESIMD)
+endif()
+
 if (GGML_SYCL_DEVICE_ARCH)
     target_compile_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
     target_link_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
