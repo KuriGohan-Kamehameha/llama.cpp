@@ -37,6 +37,7 @@
 #include "quants.hpp"
 
 #include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/esimd/memory.hpp>
 
 namespace esimd = sycl::ext::intel::esimd;
 
@@ -82,6 +83,29 @@ static void esimd_q4_k_kernel(
     float acc[ROWS_PER_THREAD] = { 0.0f };
 
     for (int sb = 0; sb < n_sblocks; ++sb) {
+        // Variant V1: prefetch next super-block's qs (per-row) + activation
+        // before this iteration's compute starts. Hide DRAM/L2 latency behind
+        // the int-MAC + reduce work below.
+        const int sb_next = sb + 1;
+        if (sb_next < n_sblocks) {
+            // V2: only prefetch the dominant qs (128B per row). Skip the small
+            // 12B scales (already adjacent in memory + usually colocated cache
+            // line) and the shared 256B activation (fits easily in L1).
+            constexpr auto pf_props = sycl::ext::oneapi::experimental::properties{
+                esimd::cache_hint_L1<esimd::cache_hint::cached>,
+                esimd::cache_hint_L2<esimd::cache_hint::cached>};
+            #pragma unroll
+            for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+                const int row = row_base + r;
+                if (row >= nrows) break;
+                const int next_block_idx = row * n_sblocks + sb_next;
+                esimd::prefetch<uint32_t, 32>(
+                    reinterpret_cast<const uint32_t *>(
+                        qs_base + next_block_idx * (QK_K / 2)),
+                    pf_props);
+            }
+        }
+
         // Activation loads — shared across all rows in this thread.
         esimd::simd<int8_t, 256> y_q_shared;
         y_q_shared.copy_from(y_qs + sb * QK_K);
