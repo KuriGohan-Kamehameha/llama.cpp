@@ -896,3 +896,76 @@ and is the immediate next dispatch target.
 - `/home/p/path3-kernel-port/ipex-q4k.ll` — full IPEX IR (80 kernels, 35K lines).
 - `/tmp/ipex_q4k_canonical.ll` — extracted canonical Q4_K kernel (442 lines).
 - `/home/p/path3-kernel-port/ipex-libggml-sycl.so` — original IPEX binary.
+
+## 2026-05-08T19:30:00Z  SPIR-V re-disasm reopens Phase B-7
+
+Targeted re-disasm of IPEX-LLM's `libggml-sycl.so` Q4_K mat-vec kernel
+vs our ESIMD Q4_K. Both extracted via `llvm-spirv -r` round-trip and
+compared at the LLVM IR / `llvm.genx.*` intrinsic level.
+
+### Findings
+
+**Both kernels use the identical genx intrinsic set** — only
+`rdregion{f,i}` and `wrregion{f,i}` (vector slice/extract/insert).
+
+What IPEX's Q4_K mat-vec kernel does NOT use:
+- DPAS / xmx / matrix-engine intrinsics (those live only in
+  `sdp_causal_xmx_kernel`).
+- LSC cache hints (only in `dg2_*_ll256_allreduce`).
+- `lsc_load`, `lsc_prefetch`, oword loads, SLM, subgroup shuffle/reduce,
+  inline ASM. None.
+- Sub-group cooperation (`!intel_reqd_sub_group_size = 1` — single-thread
+  ESIMD, same as ours).
+
+**There is no missing non-public intrinsic.** This invalidates one
+hypothesis from the Phase B-7 conclusion. The 2.7× perf gap (IPEX 17.6
+vs ours 6.41) does NOT come from a hidden hardware path.
+
+### What IPEX does differently (algorithmic, not codegen-level)
+
+| Dimension | IPEX | Ours (iter-16) |
+|---|---|---|
+| Inner-loop compute domain | **FP fmul + FP16 accumulate** | INT8 mul → INT16 → `esimd::reduce<int>` → scalar |
+| Per-instruction vector width | `<32 x float>` continuous, peak `<512 x half>` | `<64 x int16>` then narrows to scalars rapidly |
+| Activation dequantization | **Once per super-block to `<512 x float>`**, reused across all 8 sub-blocks via `rdregion` | Re-extract `<32 x i8>` slice per sub-block |
+| Weight load alignment | `align 4` (reorder layout aligned) | `align 1` (`simd<uint8,128>::copy_from(uint8_t*)`) |
+| Rows per thread | 1 | 4 |
+
+**The single biggest algorithmic delta:** IPEX dequantizes weights to
+FP32 inside the loop, multiplies FP32 weights × FP32 activations, and
+accumulates in FP16 — throwing the per-block d/min into the inner FMA
+chain. Ours does INT8 multiply (mirroring the standard SYCL kernel's
+`dpct::dp4a` shape) then horizontal-reduces to a scalar before any
+FP arithmetic.
+
+On Xe-LPG iGPU, FP throughput is plentiful and the FP-domain inner
+loop pipelines through different ALU pipes than int mul→reduce.
+This is the most plausible mechanism for the 2.7× delta.
+
+### Phase B-7 conclusion revision
+
+**The "iter-16 is the ESIMD ceiling" conclusion holds only for the
+int-domain mul+reduce inner-loop shape.** The FP-domain shape has a
+higher ceiling (per the IPEX evidence) and is closeable in pure
+ESIMD/SYCL with no exotic intrinsics.
+
+**Iter 19 unlocked**: rewrite `esimd_q4_k_kernel`'s sub-block loop to:
+1. `convert_float<32>(weights_sub_nibbles)` → `simd<float, 32>` weights
+2. `convert_float<32>(activation_sub_int8)` → `simd<float, 32>` activations
+3. `simd<float, 32> prod = w_f32 * y_f32`
+4. `acc_subblock[sub] = esimd::reduce<float>(prod, +)` per sub-block
+5. After all 8 sub-blocks, `acc8 * sub_scales_v * dy_v` (existing FP
+   tail unchanged)
+
+Plus: annotate weight `copy_from` with `align 4` (cast to
+`simd<uint32_t, 32>` view since reorder layout is 4-byte aligned).
+Removes the `align 1` codegen pessimism.
+
+Estimated effort: ~half a day for the rewrite + paired bench. If
+iter-19 lands at or above vanilla 11.67 t/s tg128, the pivot is
+validated and the Phase B-7 close-out is replaced with a Phase B-8
+opener (Q4_K-style FP-domain rewrite for the other 4 quants).
+
+If iter-19 doesn't move the needle, the ceiling conclusion holds more
+strongly than before — we'd have empirically tested the most plausible
+remaining hypothesis.
