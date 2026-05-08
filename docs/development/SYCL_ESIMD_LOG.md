@@ -618,3 +618,110 @@ splitting per-row work across subgroup lanes, moving shared activation
 to SLM, or using `esimd::lsc_load`). Pursue those interventions first;
 prefetch becomes valuable again once the GRF is no longer fully
 spoken for.
+
+## 2026-05-08T18:50:00Z  Phase B-7 perf-gap analysis (Q4_K)
+
+Latest paired bench (canonical 5-kernel + reverted-prefetch fork build,
+dolphin3 8B Q4_K_M, ASUS NUC, Arc Xe-LPG 0x7d51):
+
+| stack | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla (`reorder_mul_mat_vec_q4_k_q8_1_sycl`) | 11.67 ± 0.18 | 489.42 ± 0.36 |
+| **ESIMD iter-16** | **6.41 ± 0.01** | 485.94 ± 0.39 |
+| IPEX-LLM bundled | 17.6 | 497 |
+
+Gap to close: -5.26 t/s vs vanilla, -11.2 t/s vs IPEX.
+
+### Architecture comparison
+
+**Vanilla `mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>`:**
+- WARP_SIZE=16 (Intel target, set in `ggml/src/ggml-sycl/CMakeLists.txt:137`)
+- 1 subgroup per row; 16 work-items cooperate per row.
+- Per work-item: a few ints (`v[2]`, `u[8]`, `d8[4]`) + `partial_sum` accumulator.
+- Inner kernel: `vec_dot_q4_K_q8_1_impl_vmmq` — 2× `dpct::dp4a` calls per
+  sub-block iter (single int8×4-dot-product instruction on Xe-LPG).
+- Final reduce: `sycl::reduce_over_group` (subgroup-cooperative shuffle).
+- Per work-item live GRF: ~30 32-bit words (~120 bytes).
+
+**ESIMD iter-16 Q4_K:**
+- WG_SIZE=32, ROWS_PER_THREAD=4. No subgroup cooperation.
+- Per work-item carries the full per-super-block dot product for **4 rows**:
+  `simd<int8,256>` shared activation + 4× `simd<uint8,128>` qs +
+  `simd<uint8,12>` scales × 4 + `simd<int8,64>` w_pair / y_pair / `simd<int16,64>` prod_pair.
+- Per work-item live GRF: estimated ~2 KB.
+
+### DRAM bandwidth math
+
+Model: 4.92 GB. Per-token forward pass reads weights ~once.
+
+| stack | tg128 | effective DRAM BW |
+|--|--:|--:|
+| Vanilla | 11.67 t/s | 57.4 GB/s |
+| ESIMD   | 6.41 t/s  | 31.5 GB/s |
+
+ASUS NUC's LPDDR5x-7467 dual-channel peak: 119 GB/s. Practical iGPU
+sustained: ~80-90 GB/s.
+
+- Vanilla achieves ~64% of practical peak — close to bandwidth-bound.
+- ESIMD achieves ~35% of practical peak — **NOT bandwidth-bound**, has
+  slack to either fill more concurrent loads or reduce per-load latency.
+
+### Bottleneck hypothesis
+
+The ESIMD kernel's serialized in-thread execution caps memory-level
+parallelism (MLP). With ROWS_PER_THREAD=4 in a single work-item, weight
+loads are serialized within the thread (~16 LSC load instructions per
+super-block iter, issued one after the other). Vanilla's 16-work-item
+cooperative pattern issues 16 concurrent loads per row.
+
+The MLP gap is the main perf-gap mechanism on Xe-LPG. The compute
+math (`simd<int8,64>` packed multiply) is already efficient — adding
+more compute wouldn't move the needle.
+
+### Phase B-7 candidate interventions, ranked
+
+1. **(Highest leverage) Subgroup-cooperative ESIMD with SLM activation:**
+   WG_SIZE=16 (one subgroup/WG), ROWS_PER_THREAD=1, activation loaded
+   once per super-block into SLM by lane 0 + barrier-broadcast,
+   per-work-item handles 1/16 of the super-block via `simd<int8,16>` or
+   `simd<int8,32>`. Each work-item GRF use: ~64-128 bytes. Final reduce
+   via `sycl::reduce_over_group`. Expected gain: 1.4-1.8× via better MLP
+   + lower per-EU register pressure (more hardware threads/EU). Risk:
+   SLM serialization on broadcast; needs proper sub-group barrier discipline.
+   Rough effort: 200-300 line kernel rewrite, 1-2 agent iterations.
+
+2. **(Medium leverage) Reduce ROWS_PER_THREAD to 2 with WG_SIZE doubled
+   to 64:** keeps per-WG row coverage constant (128 rows/WG) but
+   doubles intra-WG parallelism. Expected gain: 1.1-1.3× if MLP is the
+   bottleneck. Risk: increases register pressure (32 → 64 simultaneously
+   live work-items) which could hurt occupancy. Effort: 1-line constant
+   change + bench.
+
+3. **(Speculative) `esimd::lsc_load` with `cache_hint::streaming` and
+   N>32 vector width** for next-block weights: tells L1 not to retain
+   weight loads (we only use them once per row), freeing L1 for activation
+   reuse across rows in the same WG. Expected gain: 1.05-1.15× if L1
+   thrashing is a factor. Effort: kernel patch, ~30 lines.
+
+4. **(Already tried) Default-GRF mode forcing:** kernel currently has
+   no explicit `[[intel::grf_size(N)]]` attribute, so icpx auto-picks.
+   If it's auto-selecting large-GRF, forcing default-GRF could double
+   per-EU thread count. Worth a quick experiment but lower confidence.
+
+5. **(Investigated and rejected on Xe-LPG)** xmx::dpas — see iter-15
+   note above; Xe-LPG has no real systolic hardware, DPAS regresses 4×.
+
+### Recommended next action
+
+Pursue intervention 1 (subgroup-cooperative ESIMD with SLM activation).
+This is the structural fix that brings the ESIMD kernel's parallelism
+shape in line with vanilla while keeping ESIMD's compute density on
+the actual int multiply. Intervention 2 is a low-cost tag-along worth
+running first as a quick filter.
+
+If intervention 1 doesn't deliver a significant gain, the conclusion is
+that Q4_K mat-vec on Xe-LPG iGPU is fundamentally bound by DRAM access
+latency and has little headroom in upstream code — IPEX-LLM's ceiling
+of 17.6 t/s would then have to come from something *else* (e.g. fused
+ops, a different dispatch path, or hardware-specific intrinsics not yet
+identified in their SPIR-V).
