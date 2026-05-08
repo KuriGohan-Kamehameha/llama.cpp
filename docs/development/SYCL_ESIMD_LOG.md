@@ -532,3 +532,47 @@ These are real engineering, not loop iterations. Recommended for follow-up.
 - **Iter K+M:** clean-up, upstream PR with proper benchmarks (Phase D).
 
 This is the right multi-week shape. Each iteration is bounded; logs will track each.
+
+## 2026-05-08T13:30:00Z  Phase C/B-6 parallel work — Q4_0 lands, DPAS doesn't
+
+Three parallel investigations dispatched against the iter-16 fork branch:
+
+**Phase C — Q4_0 ESIMD port**: ✓ landed (commit `e991b13`). Architecture
+generalized cleanly from Q4_K. Same ROWS=4 + WG=32 + simd<int8,64> nibble
+packing. Quant-specific changes were minimal (drop scales[12]/sub_min,
+replace with per-block d). Math token-for-token identical to vanilla on
+30-token TinyLlama 1.1B Q4_0 output.
+
+| backend | tg128 t/s |
+|---|--:|
+| Vanilla `reorder_mul_mat_vec_q4_0_q8_1_sycl` | 15.71 |
+| ESIMD `reorder_mul_mat_vec_q4_0_q8_1_sycl_esimd` | 5.03 |
+
+ESIMD/vanilla ratio ~32% (Q4_K is ~54%). Smaller-model fixed costs
+amortize less; same follow-up tunings (DPAS, prefetch) apply but not done
+in this Q4_0 patch.
+
+**Investigation — ESIMD `xmx::dpas` on Xe-LPG**: tried, **doesn't help**.
+
+DPAS standalone test compiled and ran — Xe-LPG accepts the dpas opcode
+without JIT failure (so basic systolic intrinsic dispatch is supported).
+But integrating into the q4_K kernel produced:
+
+| backend | tg128 t/s |
+|---|--:|
+| Vanilla | 3.08 (under heavy contention from parallel investigations) |
+| iter-16 ESIMD | 2.12 (contended) / 3.80 (clean reference) |
+| ESIMD + DPAS variant | **0.81** (~4× slower than vanilla, ~3× slower than iter-16) |
+
+Math correctness preserved. The huge regression is structural: Xe-LPG's
+"DPAS" support appears to be the opcode-level intrinsic emulated via
+scalar lanes (or a small systolic array that doesn't amortize the data
+reshape overhead). Full XMX matrix engines are an Arc-dGPU feature; the
+iGPU variant doesn't have the throughput to make the reshape worthwhile.
+
+**Recommendation: do not pursue DPAS on Xe-LPG iGPU.** It may pay off on
+Arc dGPUs (B-series, Battlemage) but not here. Save this finding to avoid
+re-investigation.
+
+**Phase B-6 prefetch investigation and Phase C Q6_K port** in flight at
+time of writing.
