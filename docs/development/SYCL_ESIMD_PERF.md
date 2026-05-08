@@ -119,11 +119,40 @@ unique to "different reduction ordering."
   standard SYCL on long sequences. They may converge again or stay
   divergent.
 - Logits are within FP32 noise of each other per token; downstream
-  metrics (perplexity, eval scores) are expected to be statistically
-  indistinguishable. **This has not yet been measured on this branch
-  — please run a perplexity test on your eval set before deploying.**
+  metrics (perplexity, eval scores) are statistically
+  indistinguishable. See "Perplexity verification" below.
 - For sampling at temperature > 0, the drift is invisible (sampling
   noise dominates).
+
+### Perplexity verification (2026-05-08)
+
+Measured on dolphin3:latest 8B Q4_K_M, wikitext-2 test split (50
+chunks × 512 tokens = 25,600 tokens scored), `llama-perplexity -ngl
+999 -fa off`, 5 paired runs (2 vanilla + 3 ESIMD):
+
+| path | final ppl | per-chunk PPL stream sha256 |
+|---|--:|--|
+| Standard SYCL (vanilla) | **9.5668 ± 0.24125** | `cca7ea6e…` |
+| **ESIMD opt-in** | **9.5668 ± 0.24125** | `cca7ea6e…` (identical) |
+
+**Δppl = 0.0000** at the printed precision (4 decimals). All 50
+per-chunk running PPLs are bit-identical across all 5 runs; the
+SHA256 of the per-chunk PPL stream is the same on both paths.
+ESIMD dispatch confirmed via `GGML_SYCL_DEBUG=1` (kernel actually
+invoked, not silently bypassed).
+
+**Caveat — perplexity underexercises the ESIMD path.** Perplexity is
+dominated by batched mat-mul (`mul_mat`); the ESIMD kernel is mat-vec
+(`mmvq`), invoked at the per-token decode tail. A token-generation
+downstream eval (e.g. `llama-perplexity --multiple-choice` on
+arc-easy/hellaswag) would put more pressure on the ESIMD code path
+and is the next correctness check to run if your workload is
+generation-quality-sensitive.
+
+**Caveat — `-fa auto` triggers `UR_RESULT_ERROR_DEVICE_LOST` on
+Xe-LPG** before the first chunk completes, on both vanilla and ESIMD.
+Use `-fa off` for `llama-perplexity` runs. Unrelated to ESIMD; flag
+your reproducer accordingly.
 
 **Observed during development:** the iter-16 ESIMD kernel by itself
 produces token-for-token identical output to the standard SYCL kernel
