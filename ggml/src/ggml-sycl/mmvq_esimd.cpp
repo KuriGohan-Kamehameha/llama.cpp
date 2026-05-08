@@ -48,6 +48,13 @@ namespace esimd = sycl::ext::intel::esimd;
 // (ROWS=1: 4.14, ROWS=2: 5.18, ROWS=4: 5.55, ROWS=8: 4.30 due to register
 // pressure). Other Intel iGPU/dGPU classes may have different optima;
 // this is a tuning knob.
+//
+// IPEX-LLM IR analysis (2026-05-08) shows IPEX uses ROWS=16 + NSG=8 +
+// SLM-cooperative activation broadcast — their per-thread weight footprint
+// is 4× ours, but they free the GRF that would be needed for activation by
+// cooperatively staging it through SLM. See SYCL_ESIMD_LOG.md "iter 19"
+// for the implementation roadmap. Until that lands, ROWS=4 is the local
+// max for this all-in-GRF architecture.
 constexpr int ROWS_PER_THREAD = 4;
 
 template <int VEC_W>

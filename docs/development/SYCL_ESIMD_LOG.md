@@ -810,3 +810,89 @@ is documented with both wins and dead ends.** Future contributors
 or Phase E (cross-paradigm kernel research) from a clean base.
 
 End of Phase B-7.
+
+## 2026-05-08T19:50:00Z  IPEX-LLM IR drill-down — Phase B-7 reframed
+
+Phase E + IPEX Q4_K disasm subagent (`ad67bd6c37a23dda0`) extracted
+80 ESIMD kernel template specializations from `libggml-sycl.so` for
+Q2_K..Q6_K. Decoded the canonical Q4_K kernel signature
+`vec_q4_K_batch_kernel<f, 2, 1, 16, 8, 64, 1, 0>` to:
+
+| param | IPEX value | our iter-16 |
+|---|---|---|
+| ROWS_PER_THREAD | **16** | 4 |
+| NUM_SUBGROUPS (work-group threads) | **1..8** runtime-picked | 32 |
+| SUBGROUP_SIZE (logical ESIMD vector width) | 64 | 32 |
+| USE_LSC | 1 (`<256 x i8>` aligned-4 loads) | implicit via copy_from |
+| USE_DPAS | **0** (not used for Q-class — confirms our prior DPAS dead-end) | 0 |
+
+### The structural delta
+
+IPEX **cooperatively loads activation into SLM** at the top of each
+super-block. Every thread in the work-group stores a stride-32 chunk of
+the activation to SLM (converted to `<256 x half>`), `genx::barrier`,
+then every thread loads `<512 x half>` back from SLM. This means:
+
+- **Activation DRAM/L2 traffic = 1× per work-group**, not 1× per thread.
+- With WG_SIZE=32, our fork pulls activation 32× more bandwidth than
+  necessary. On Xe-LPG with constrained iGPU memory hierarchy, this is
+  exactly the bottleneck signature observed (`pp1024 == default but
+  tg128 = 0.55×`: prompt-fill isn't activation-bound; per-token mat-vec is).
+
+The other key finding: **IPEX uses half-precision MAC** not int16.
+Pre-conversion to half happens once at SLM store; inner accumulator is
+`<128 x half>`; final tree-reduce + fpext at the very end. Our fork
+does `<32 x int16> mul → reduce<int> → fp` — strictly more conversion
+work per super-block.
+
+### The closed-form "iter-16 ceiling" claim is wrong
+
+My Phase B-7 close-out was premature. The ROWS=2 negative result
+(-21%) showed shared-activation amortization is dominant, but I
+generalized that to "ESIMD ceiling reached." The IPEX evidence shows
+the right interpretation: **shared-activation matters, and it's
+even more powerful via SLM cooperation than via per-thread GRF
+sharing**. Our kernel implements the GRF-shared variant; IPEX implements
+the SLM-shared variant, which scales to NSG=8 instead of being
+limited to ROWS=4 by per-thread GRF capacity.
+
+### Phase B-7 reframed as "iter 19" — SLM-coop activation + RPT=16
+
+Concrete plan:
+1. Move shared activation from per-thread `simd<int8,256>` GRF →
+   workgroup-scope SLM via `local_accessor<sycl::half, 1>`.
+2. Restructure the per-super-block loop around a SYCL group barrier:
+   threads cooperatively store strided chunks → barrier → all threads
+   read full activation from SLM.
+3. Lift `ROWS_PER_THREAD` from 4 to 16 (frees-up GRF previously
+   holding activation now goes to weight buffers).
+4. Drop WG_SIZE from 32 to 8 (matches IPEX NSG=8); 8 threads × 16 rows =
+   128 rows per work-group, same row coverage we have today.
+5. (Stretch) switch inner MAC from int16 to half-precision — saves
+   compute cycles and removes a reduction step.
+
+### Expected impact (per agent's analysis)
+
+- #1 + #2 + #3 (SLM-coop + RPT=16 + half MAC): 0.55× → ~0.95-1.05×
+  vanilla SYCL = ~11-12 t/s tg128 on dolphin3 8B Q4_K_M.
+- + #4 (per-NSG runtime variant pick) + LM-head specialization:
+  marginal additional ~5-10%.
+- Realistic ceiling on Xe-LPG iGPU for ESIMD-only changes: ~13-14 t/s
+  = ~80% of IPEX. Closing the rest requires the q8_1 activation packing
+  layout which the IR alone doesn't reveal.
+
+### Effort estimate
+
+- iter 19 (SLM-coop activation, RPT=16, drop GRF activation): ~4-6 days.
+- iter 20 (half-precision MAC, with perplexity bit-equivalence verification): ~2-3 days.
+- iter 21 (per-NSG runtime variant pick): ~2 days.
+- iter 22 (LM-head specialized kernel): ~1-2 days.
+
+Multi-week scope. Iter 19 is the highest-leverage single intervention
+and is the immediate next dispatch target.
+
+### Files of interest on branch-0
+
+- `/home/p/path3-kernel-port/ipex-q4k.ll` — full IPEX IR (80 kernels, 35K lines).
+- `/tmp/ipex_q4k_canonical.ll` — extracted canonical Q4_K kernel (442 lines).
+- `/home/p/path3-kernel-port/ipex-libggml-sycl.so` — original IPEX binary.
