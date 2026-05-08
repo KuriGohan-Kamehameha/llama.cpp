@@ -1107,8 +1107,22 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q4_0:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_0_q8_1_sycl\n");
-                    reorder_mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+#ifdef GGML_SYCL_ESIMD
+                    static const bool use_esimd_q4_0 =
+                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
+                    // ESIMD kernel needs multiples of 8 Q4_0 blocks per row.
+                    if (use_esimd_q4_0 && (ne00 % (QK4_0 * 8) == 0)) {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_0_q8_1_sycl_esimd\n");
+                        extern void reorder_mul_mat_vec_q4_0_q8_1_sycl_esimd(
+                            const void *, const void *, float *, int, int, dpct::queue_ptr);
+                        reorder_mul_mat_vec_q4_0_q8_1_sycl_esimd(
+                            src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    } else
+#endif
+                    {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_0_q8_1_sycl\n");
+                        reorder_mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    }
                 } else {
                     GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_0_q8_1_sycl\n");
                     mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
