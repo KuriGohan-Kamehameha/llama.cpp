@@ -19,6 +19,13 @@ cmake -B build -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL \
 cmake --build build --config Release -j --target llama-bench
 ```
 
+**Build resource note.** `icpx` compiling the ESIMD kernels with full
+parallelism uses ~3-4 GB RAM per concurrent translation unit; on the
+ASUS NUC reference (16 hardware threads) a default `-j` build can spike
+to >40 GB peak RAM. If you hit a kernel-OOM-killed build (`icpx: error:
+unable to execute command: Killed`), retry with `-j 4` or `-j 2` to
+reduce parallelism, or close other GPU/CPU-heavy processes first.
+
 Bench (8B Q4_K_M model, all layers offloaded, 3 reps):
 
 ```sh
