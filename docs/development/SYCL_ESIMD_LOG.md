@@ -725,3 +725,88 @@ latency and has little headroom in upstream code — IPEX-LLM's ceiling
 of 17.6 t/s would then have to come from something *else* (e.g. fused
 ops, a different dispatch path, or hardware-specific intrinsics not yet
 identified in their SPIR-V).
+
+## 2026-05-08T19:00:00Z  Iter 18 — ROWS_PER_THREAD=2 experiment: NEGATIVE
+
+Tested intervention 2 from the Phase B-7 analysis: drop ROWS_PER_THREAD
+from 4 to 2. Hypothesis was that doubling the workgroup count would
+expose more memory-level parallelism on Xe-LPG.
+
+Bench (paired -r 5, dolphin3 8B Q4_K_M, ASUS NUC, Arc Xe-LPG):
+
+| build | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla | 11.82 ± 0.05 | 488.17 ± 1.34 |
+| ESIMD ROWS=4 (canonical) | 6.41 ± 0.01 | 485.94 ± 0.39 |
+| **ESIMD ROWS=2 (iter 18)** | **5.09 ± 0.01** | 486.08 ± 0.52 |
+
+ROWS=2 regressed -21% from ROWS=4. The shared-activation amortization
+(load 256 B activation once, multiply against 4 rows' weights) is the
+dominant per-thread perf factor; halving the share count (from 4 rows
+to 2) lost more than the doubled workgroup parallelism gained.
+
+This **invalidates the MLP-bottleneck hypothesis**. The ESIMD kernel is
+NOT memory-level-parallelism limited — adding more in-flight workgroups
+doesn't help because each thread is already keeping enough memory
+operations in flight (activation share amortization gives each thread
+4× the per-load reuse).
+
+**Reframed bottleneck: per-thread compute density.** The ESIMD kernel's
+compute density per thread is what matters. ROWS=4 hits a sweet spot
+where per-thread int8 multiplies (256 weights × 4 rows = 1024 multiplies
+per super-block per thread) saturate the EU's int math units while
+register pressure stays under ceiling. ROWS=2 drops to 512 multiplies
+per sb per thread = under-utilized EU compute.
+
+This **also weakens the case for intervention 1 (subgroup-cooperative
+ESIMD with SLM activation)** — it would re-distribute compute across
+16 lanes per row, giving each lane only 16 weights × 1 row = 16
+multiplies per super-block. That's 64× less per-thread compute density
+than ROWS=4. Even with vanilla's bandwidth-friendly access pattern,
+the per-EU compute throughput per cycle would be much lower.
+
+### Reframed Phase B-7 conclusion
+
+The iter-16 architecture (ROWS=4, WG=32, simd<int8,64> packed multiply,
+shared activation) is **near the ESIMD ceiling on Xe-LPG iGPU** for
+mat-vec on Q4_K. The remaining gap to vanilla (0.55× → 1.0×) and to
+IPEX-LLM (0.55× → 1.51×) is unlikely to come from per-quant kernel
+tuning — vanilla's win is structural (subgroup cooperation lets
+per-thread compute be small while keeping EUs busy via thread-level
+parallelism; ESIMD trades that for in-thread vector width which
+saturates per-EU compute differently).
+
+To close the gap further on Xe-LPG iGPU, candidates outside per-quant
+kernel tuning include:
+1. **Fused multi-op kernels** — combine mat-vec with the next op
+   (e.g. RMSNorm + mat-vec fusion) so the same activation tile is
+   re-used across more arithmetic. Requires touching the dispatch
+   layer, not just mmvq.
+2. **Different parallelism shape entirely** — e.g. a hybrid where
+   ESIMD handles the int8 multiply and SYCL subgroup ops handle
+   the reduce. Would require a cross-paradigm kernel.
+3. **Hardware-specific intrinsics not yet identified in IPEX SPIR-V**
+   — re-disassembling IPEX's `libggml-sycl.so` for the Q4_K kernel
+   specifically and comparing to our ESIMD output might reveal what
+   they're doing differently.
+4. **Mat-mul instead of mat-vec** — for batch_size>1 paths, Q4_K's
+   `mul_mat_q` (mmq.cpp) already takes over (visible as pp1024 at
+   parity in our benches). The ESIMD opt-in's value is bounded to
+   the mat-vec decode path.
+
+### Closing recommendation for Phase B-7
+
+**Stop iterating on ROWS_PER_THREAD / WG_SIZE / per-thread compute
+sweeps.** The iter-16 architecture is the local maximum on Xe-LPG
+iGPU. Further gains in mat-vec require either fused-op work or
+hardware-specific intrinsic mining from IPEX's binary — both of which
+are multi-week engineering tasks outside the scope of "land an opt-in
+ESIMD code path so the door is open upstream."
+
+The fork's value is now established: **the ESIMD code path exists,
+all 5 quants are wired up, perplexity is verified, the architecture
+is documented with both wins and dead ends.** Future contributors
+(human or AI) can pick up Phase D (upstream PR or fork-merge campaign)
+or Phase E (cross-paradigm kernel research) from a clean base.
+
+End of Phase B-7.
