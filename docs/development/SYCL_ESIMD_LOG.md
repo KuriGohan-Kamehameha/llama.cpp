@@ -1063,3 +1063,81 @@ who owns the kernel deeply, can debug it without AI assistance, and
 will engage with reviewers in their own voice. Until then the fork
 is the canonical channel; downstream users (e.g. Aimee on a NUC
 class machine) can apply this branch directly.
+
+## 2026-05-08T22:00:00Z  Iter 20 — SLM-cooperative + ROWS=8: FALSIFIED
+
+Implemented SLM-cooperative activation loading with ROWS_PER_THREAD=8.
+Architecture: WG=32 stays the same; per super-block, lane-0 cooperatively
+stores `<256 x int8>` activation to SLM via `local_accessor`; group_barrier;
+each work-item reads its own copy back. Frees ~256 B per-thread GRF
+(activation no longer in-register), allowing weight state for 8 rows
+instead of 4.
+
+Bench (paired r=5, dolphin3 8B Q4_K_M, branch-0 IPEX-runner contention
+suppressing absolute numbers ~15%; relative paired comparison still valid):
+
+| build | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla | 11.01 ± 0.01 | 483.29 ± 1.05 |
+| ESIMD iter-16 | 5.43 ± 0.01 | 482.16 ± 0.98 |
+| **ESIMD iter-20 (SLM ROWS=8)** | **4.69 ± 1.10** | 481.85 ± 0.31 |
+
+iter-20 lands at 0.86× iter-16 (regression) with ~100× higher variance
+(σ=1.10 vs 0.01). The high variance signals SLM access serialization
+or barrier contention — these are non-deterministic at the memory-subsystem
+level. Iter-16's all-in-GRF approach has σ=0.01 (perfectly deterministic).
+
+### What this rules out
+
+The hypothesis "the ROWS ceiling at 4 is set by GRF held by the activation;
+freeing activation to SLM lifts the ceiling" is **falsified**. ROWS=8 with
+SLM-staged activation does NOT outperform ROWS=4 with GRF-staged activation.
+
+This points the bottleneck **away from per-thread GRF capacity** as the
+dominant constraint. The actual constraint is most likely the int8→int16
+multiplier pipeline depth on Xe-LPG XVE units, which neither SLM staging
+nor row fan-out can mask further.
+
+### Side finding: kernel cohabitation perf interference
+
+The build with iter-16 + iter-20 (both kernels in `libggml-sycl.so`)
+produced iter-16 tg128 = 5.57 instead of the canonical 6.41 (-13%). After
+removing the iter-20 code and rebuilding, iter-16 returned to its expected
+canonical baseline (modulo the box contention factor). This is the same
+compile-time interference pattern documented in `SYCL_ESIMD_PERF.md`'s
+FP-precision-class drift section: adding a sibling kernel to the same
+.so shifts icpx's reg allocation enough to perturb the live kernel's
+codegen. **Worth noting for future contributors:** if you add an
+experimental kernel for a perf comparison, build TWO `.so` files (one
+with each variant) and bench separately — don't trust paired-in-one-build
+numbers when comparing experimental kernels to the canonical iter-16.
+
+### Five-interventions empirical pattern
+
+After iter-20:
+- Iter 17 prefetch: no gain
+- Iter 18 ROWS=2: -21% regression
+- Iter 19 FP-domain inner loop: -1.6% wash
+- Iter 19' RPT=16/WG=8 SLM (subagent hypothesis, contradicted by SPIR-V): not landed
+- **Iter 20 SLM-coop + ROWS=8: -14% regression with 100× higher variance**
+
+The pattern: every intervention that changes the per-thread parallelism
+shape away from iter-16's (ROWS=4, WG=32, GRF-resident activation,
+INT-domain mul→reduce) either does nothing or regresses. Five
+interventions, zero positive results.
+
+### Phase E status: pursuing one more variant before final close-out
+
+Per Piranesi (soul-merged piranesi-dolphin3 consult, 2026-05-08T21:58:00Z):
+"diminishing returns... half-precision MAC operations could potentially
+offer incremental gains and warrant further investigation before
+concluding the final ceiling for Xe-LPG iGPU ESIMD performance."
+
+Iter 21 dispatched: half-precision MAC variant of iter-16. Same architecture
+(ROWS=4, WG=32, GRF-resident activation) but `simd<half, 64>` mul + reduce
+instead of `simd<int8, 64>` mul + `simd<int16, 64>` reduce. Halves the
+mul intermediate footprint vs FP32 (iter-19 wash) while testing whether
+FP16 throughput on Xe-LPG XVE beats int8 throughput.
+
+If iter-21 also lands within ±5% of iter-16, the structural ceiling
+on this hardware class is settled.
