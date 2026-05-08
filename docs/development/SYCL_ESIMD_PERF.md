@@ -71,6 +71,23 @@ Q5_K reads from the standard `block_q5_K` layout (no reorder layout
 exists in the ggml-sycl tree), which keeps the change surface small
 but means it can't share Q4_K's cross-block contiguous prefetch.
 
+### Q8_0 (dolphin3:latest 8B, requantized to Q8_0)
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `reorder_mul_mat_vec_q8_0_q8_1_sycl`) | 464 | 9.72 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 460 | 4.20 | 0.43× |
+
+Q8_0's ratio is in family with the prior quants but for a different
+structural reason: Q8_0 has no nibble-unpack work for ESIMD to
+specialize on, and the standard kernel's `dpct::dp4a` int8×4 dot-product
+intrinsic is already a single instruction on Xe-LPG. Explicit SIMD
+widening doesn't unlock parallelism the compiler couldn't already see;
+register pressure becomes the binding constraint sooner with 32 B
+weight loads per block than with 16 B nibble-packed loads. With
+Q4_0/Q4_K the nibble unpack creates compute work the auto-vectorizer
+can mishandle — Q8_0 has no such opening.
+
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
 
@@ -170,7 +187,9 @@ beyond what perplexity tests catch, stay on the standard SYCL path.
 
 ## Scope
 
-- **Q4_K only** at present. Q4_0/Q5_K/Q6_K/Q8_0 are tracked as follow-ups.
+- **All five quants in the test roster:** Q4_K (foundation), Q4_0,
+  Q5_K, Q6_K, Q8_0. Other formats (Q2_K, Q3_K, Q4_1, Q5_0, Q5_1, etc.)
+  are tracked as follow-ups.
 - **Intel iGPU/dGPU only.** ESIMD is an Intel-specific extension; the
   build flag has no effect on AMD/NVIDIA SYCL targets.
 - **Foundation, not finished.** Documented dead ends + tried-and-rejected
