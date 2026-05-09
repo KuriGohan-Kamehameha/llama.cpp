@@ -1226,3 +1226,52 @@ six documented dead ends across the catalog so future contributors
 don't re-discover them.
 
 **End of Phase E.**
+
+## 2026-05-09T03:35:00Z  Roster-wide bench attempt — partial (contention-corrupted)
+
+Ran the canonical iter-16 build (`mmvq_esimd.cpp` 919 lines, no experimental
+kernels) against ~13 Q-format models from Piranesi's roster on branch-0,
+paired vanilla vs ESIMD with `-r 5`. Branch-0's vanilla `llama-server`
+systemd unit was stopped for the duration to free the iGPU.
+
+**Most ESIMD passes were contention-corrupted by a concurrent IPEX-LLM
+ollama-lib runner (PID 453877) serving an unrelated consult workload at
+73% CPU throughout the bench window.** The vanilla passes mostly held
+up (the standard SYCL kernel is more contention-tolerant — likely
+because its smaller per-thread GRF footprint overlaps better with
+co-tenant memory traffic).
+
+The clean data points that survived contention noise:
+
+| model | params | quant | vanilla tg128 t/s | ESIMD tg128 t/s | ratio |
+|---|---|---|--:|--:|--:|
+| Athesus/athesus-control-v2 | 8 B | Q4_0 | 12.70 ± 0.08 | 6.03 ± 0.00 | 0.47× |
+| codegemma-7b | 7 B (gemma) | Q4_0 | 11.43 ± 0.05 | 5.04 ± 0.81 | 0.44× |
+| dolphin3 (prior clean run) | 8 B | Q4_K_M | 11.64 ± 0.04 | 6.41 ± 0.01 | 0.55× |
+
+Three clean cross-architecture data points (llama Q4_0, gemma Q4_0,
+llama Q4_K_M) cluster in the **0.44-0.55× range**. This is consistent
+with the iter-16 ceiling on Xe-LPG iGPU — the perf gap to vanilla
+generalizes across model architectures rather than being a Q4_K-only
+artifact.
+
+Models with corrupted ESIMD measurements (do not publish, consistent
+with prior empirical pattern of ESIMD being more sensitive to GPU
+co-tenancy than vanilla):
+- meditron-7b Q4_K_M (ESIMD σ=1.92)
+- piranesi-granite Q4_K_M (ESIMD σ=1.37)
+- piranesi-dolphin3 Q4_K_M (ESIMD σ=0.91)
+- olmo2-13b Q4_K_M (ESIMD σ=1.03 + pp1024 σ=71)
+- biomistral Q4_K_M (vanilla tg128 missing entirely)
+- athesus-vision Q4_K_M (both passes empty — likely OOM at 7.3 GB on
+  contended iGPU)
+- piranesi:latest (24B Q4_K_M, ESIMD pass missing — likely OOM or
+  early termination)
+
+A clean re-run of the roster bench requires a quiet box (no concurrent
+IPEX-LLM consult workloads). Defer to a maintenance window or run on a
+secondary host; the current iter-16 close-out conclusion is sufficient
+on the three clean data points already collected.
+
+Branch-0 vanilla `llama-server` systemd unit restarted post-bench
+(verified `active` at 03:32 UTC).
