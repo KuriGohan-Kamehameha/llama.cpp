@@ -214,6 +214,28 @@ pipeline that cares about exact output. The runtime env-var gate makes
 A/B comparison trivial. If your workload is generation-quality-sensitive
 beyond what perplexity tests catch, stay on the standard SYCL path.
 
+### Per-quant verification roster (2026-05-10, ongoing)
+
+The Q4_K_M block above is the original verification. Other ESIMD-wired
+quants are gated through `docs/development/perplexity-suite.sh`-style
+paired runs, one quant per scheduled-task firing.
+
+| quant | model | vanilla ppl | ESIMD ppl | Δ abs / % | per-chunk sha256 |
+|---|---|--:|--:|--:|--|
+| Q4_0 | dolphin3 8B (requantized from Q4_K_M) | **10.0751 ± 0.25623** | **10.0751 ± 0.25623** | 0.0000 / 0.000% | `e3d40908…` (identical) |
+
+Q4_0 verification (2026-05-10): 2 vanilla + 2 ESIMD runs on wikitext-2
+test split, 50 chunks × 512 tokens = 25,600 tokens scored,
+`llama-perplexity -ngl 999 -fa off`, dolphin3:latest 8B requantized to
+Q4_0 with `--allow-requantize`. All 4 runs printed `Final estimate:
+PPL = 10.0751 +/- 0.25623` and produced bit-identical per-chunk PPL
+streams (sha256 `e3d40908f72b50b8d315875aeb626a52c3dfbed757c4dd50b0c5beed8e338a0b`).
+Bench env had an idle gpt-oss-abliterated:20b llama-server resident in
+GPU memory (compute-uncontended; perplexity is a correctness metric
+and not affected by throughput contention). Same identical-stream
+result as the Q4_K_M precedent — Q4_0 ESIMD path is bit-for-bit
+equivalent to standard SYCL on this Q4_0 model.
+
 ## Scope
 
 - **All five quants in the test roster:** Q4_K (foundation), Q4_0,
