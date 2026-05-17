@@ -223,6 +223,7 @@ paired runs, one quant per scheduled-task firing.
 | quant | model | vanilla ppl | ESIMD ppl | Δ abs / % | per-chunk sha256 |
 |---|---|--:|--:|--:|--|
 | Q4_0 | dolphin3 8B (requantized from Q4_K_M) | **10.0751 ± 0.25623** | **10.0751 ± 0.25623** | 0.0000 / 0.000% | `e3d40908…` (identical) |
+| Q5_K | TinyLlama 1.1B Q5_K_M | **18.6953 ± 0.56406** | **18.6953 ± 0.56406** | 0.0000 / 0.000% | `2d2f2781…` (identical) |
 
 Q4_0 verification (2026-05-10): 2 vanilla + 2 ESIMD runs on wikitext-2
 test split, 50 chunks × 512 tokens = 25,600 tokens scored,
@@ -235,6 +236,23 @@ GPU memory (compute-uncontended; perplexity is a correctness metric
 and not affected by throughput contention). Same identical-stream
 result as the Q4_K_M precedent — Q4_0 ESIMD path is bit-for-bit
 equivalent to standard SYCL on this Q4_0 model.
+
+Q5_K verification (2026-05-17): 2 vanilla + 2 ESIMD runs on wikitext-2
+test split, 50 chunks × 512 tokens = 25,600 tokens scored,
+`llama-perplexity -ngl 999 -fa off`, TinyLlama 1.1B Q5_K_M
+(`tinyllama:1.1b-chat-v1-q5_K_M` ollama blob,
+sha256 `2fdab35cfeff7068ff8df4c227be3bce6c1001397e0c69abfe8151124519dc96`).
+Model swap to TinyLlama vs. the Q4_K/Q4_0 dolphin3 8B precedent: a
+genuine Q5_K_M GGUF was already on disk, while requantizing Q4_K_M →
+Q5_K_M would have layered Q4_K's loss under Q5_K's and reported a
+misleading ppl. The kernel-equivalence signal (paired identical
+streams) is model-independent; the absolute ppl is not comparable to
+the Q4_0 / Q4_K rows. All 4 runs printed `Final estimate: PPL =
+18.6953 +/- 0.56406` and produced bit-identical per-chunk PPL streams
+(sha256 `2d2f2781c80db923c730cf9b5495104a72a477b19231d0665483ef356c32aef5`).
+GPU uncontended at bench time (no concurrent llama/ollama workers).
+Same identical-stream result as the Q4_K_M and Q4_0 precedents — Q5_K
+ESIMD path is bit-for-bit equivalent to standard SYCL on this model.
 
 ## Scope
 
