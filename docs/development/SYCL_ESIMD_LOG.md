@@ -1354,3 +1354,74 @@ Pending quants in priority order: Q2_K, Q4_1, Q5_0, Q5_1. The
 schedule's per-firing job spec lands one kernel; subsequent firings
 will close the remaining four.
 
+
+## 2026-05-21T  Q2_K ESIMD kernel landed — coverage extension
+
+Extended ESIMD coverage to Q2_K. Seventh ESIMD mat-vec kernel; pending
+list drops from {Q2_K, Q4_1, Q5_0, Q5_1} to {Q4_1, Q5_0, Q5_1}.
+
+### Architecture
+
+Q2_K layers two existing patterns:
+- **Output-position layout from Q3_K**: same `l = 128*n + 32*j + 16*half
+  + k` decomposition, same "qs slice base = 32*n, shift = 2*j" indexing,
+  same first-16/second-16 split per q8_1 sub-block.
+- **Min-term from Q4_K**: weights are unsigned 2-bit [0,3]; per-half
+  sub-min is subtracted at the super-block level (`d * sumf_d - dmin *
+  sumf_m`).
+
+Q2_K-specific structural choice that diverges from Q4_K/Q5_K: each
+q8_1 sub-block has *two* mins (`scales[2*q]` high-nibble for low-16,
+`scales[2*q+1]` high-nibble for high-16), so the precomputed `sy`
+element of q8_1's ds half2 (which gives only the *full* sum of u
+quants) cannot be reused for the min term. The kernel computes per-
+half `sum_u` values manually via `esimd::reduce<int>` on int8
+halves, hoisted out of the 4-row inner loop since `y_q_shared` is
+identical across all rows in this thread. Net cost: 8 reductions per
+super-block per thread (not per row), well amortized.
+
+Scale unpack is the simplest of the 6 K-quants now wired: a single
+byte per sub-scale, low nibble = scale, high nibble = min. No
+6-bit-packed scales[12] shuffle (Q3_K, Q4_K, Q5_K), no 16 signed
+int8 scales (Q6_K).
+
+### Bench (paired r=5, TinyLlama 1.1B Q2_K, branch-0 quiet)
+
+| build | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla | 25.10 ± 0.11 | 1340.92 ± 11.45 |
+| **ESIMD** | **22.07 ± 0.08** | 1363.68 ± 17.00 |
+
+tg128 ratio: **0.88× vanilla** — the best ratio of the seven landed
+quants (previous best: Q5_K at 0.86×). Mechanism: Q2_K's per-sub-block
+arithmetic is the lightest of the K-quants (no hmask decode, no
+6-bit-packed scale shuffle, unsigned-only weights), so the inner loop
+has less work to amortize against the GRF-resident shared activation —
+keeping ESIMD competitive with the standard SYCL `dp4a` path.
+
+ESIMD σ=0.08 vs vanilla σ=0.11: closest match yet. Both kernels are
+near-perfectly contention-free at this compute density on Xe-LPG.
+
+pp1024 doesn't pass through mmvq; the 1364 vs 1341 delta is noise.
+
+### Correctness
+
+Paired llama-cli, seed=1, temp=0, 30 tokens, photosynthesis prompt:
+
+```
+Vanilla:  1. Photosynthesis is the process by which plants convert
+          carbon dioxide into sugar through a photosynthetic reaction. 2.
+
+ESIMD:    1. Photosynthesis is the process by which plants convert
+          carbon dioxide into sugar through a photosynthetic reaction. 2.
+```
+
+Bit-identical. Formal perplexity gate deferred per onboarding-section
+guidance.
+
+### Status
+
+Pending quants in priority order: Q4_1, Q5_0, Q5_1. Three left in the
+contributor-onboarding pending list before this schedule's job spec
+("if all 5 pending quants are now wired, disable schedule") triggers.
+

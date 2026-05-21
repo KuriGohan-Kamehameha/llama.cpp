@@ -137,6 +137,34 @@ The pp1024 path doesn't pass through `mmvq` — pp uses the batched
 `mmq` kernels — so the ~1.2× pp delta here is noise/independent of
 the ESIMD change. Only the tg128 ratio is the load-bearing signal.
 
+### Q2_K (TinyLlama 1.1B, requantized to Q2_K)
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `mul_mat_vec_q2_K_q8_1_sycl`) | 1341 | 25.10 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 1364 | 22.07 | 0.88× |
+
+Q2_K shares Q3_K's output-position mapping (`l = 128*n + 32*j +
+16*half + k`) and the raw-block read path. The kernel uses Q3_K's
+qs/scale layout but no hmask (weights are unsigned 2-bit, range
+[0,3]) and adds Q4_K's min-term. Crucially, Q2_K's two halves of a
+q8_1 sub-block can have *different* mins (`scales[2*q]` low nibble +
+`scales[2*q+1]` low nibble for the d-term, high nibbles for the
+m-term), so `sy` cannot be reused as in Q4_K/Q5_K. The kernel
+computes per-half `sum_u` once per super-block (hoisted out of the
+4-row inner loop since `y_q_shared` is identical across rows) using
+`esimd::reduce<int>` on int8 halves.
+
+At 0.88× vanilla, Q2_K lands as the best ratio of the six covered
+quants — slightly above Q5_K's 0.86×. The mechanism is the same:
+raw-block read + unsigned-only weight decode keeps the per-sub-block
+arithmetic shorter than Q3_K's bit-mask decode or Q6_K's two-byte
+qh/ql composition, so the int-pipe loop has less work to amortize
+against the GRF-resident shared activation. ESIMD σ=0.08 vs
+vanilla's σ=0.11 — the deterministic-vs-contended signature is
+narrowest here because Q2_K's per-row compute is light enough that
+the standard kernel is also nearly contention-free.
+
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
 
