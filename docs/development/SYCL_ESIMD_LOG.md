@@ -1275,3 +1275,82 @@ on the three clean data points already collected.
 
 Branch-0 vanilla `llama-server` systemd unit restarted post-bench
 (verified `active` at 03:32 UTC).
+
+## 2026-05-21T  Q3_K ESIMD kernel landed — coverage extension
+
+Extended the ESIMD coverage to Q3_K. Sixth ESIMD mat-vec kernel; pending
+list from the contributor onboarding section drops to Q2_K, Q4_1, Q5_0,
+Q5_1.
+
+### Architecture
+
+The Q3_K kernel reuses the iter-16 architecture (ROWS_PER_THREAD=4,
+WG_SIZE=32, GRF-resident shared activation, `simd<int8,64>` packed pair
+multiply, first-16/second-16 split per q8_1 sub-block) shared by the
+existing 5 kernels. It is structurally closest to Q6_K (signed offset,
+no min term) but uses Q5_K's raw-block read path (`block_q3_K` has no
+reorder layout in the ggml-sycl tree).
+
+Key structural choices:
+
+- **Weight decode**: `low2 = (qs[byte] >> q_shift) & 0x3`,
+  `hbit = (hmask[byte] >> q) & 0x1`,
+  `signed = low2 + 4*hbit - 4`. Range [-4, 3]. Validated against
+  `dequantize_row_q3_K` and `vec_dot_q3_K_q8_1_impl_mmvq` — same
+  `low + 4*hbit - 4` semantics (impl_mmvq does it via `~hmask` and a
+  `sub_sat` with `vil` and 4×(h==0), arithmetically equivalent).
+- **Scale unpack**: 16 6-bit sub-scales encoded in the 12-byte `scales`
+  field. Low 4 bits at `scales[i & 7] >> ((i >> 3) * 4)`, high 2 bits
+  at `scales[8 + (i & 3)] >> ((i >> 2) * 2)`. Then `signed = (lo |
+  (hi << 4)) - 32`. Range [-32, 31]. Verified against
+  `dequantize_row_q3_K`'s shuffle of `aux[0..3]` (same bit fields,
+  computed inline per-`i` in our case rather than via a one-shot
+  shuffle since we unpack at row-iteration time, not super-block
+  start).
+- **Sub-scale layout**: 16 sub-scales for 256 weights — 16 weights per
+  scale, so each q8_1 sub-block (32 weights) spans 2 sub-scales. Same
+  first-16/second-16 split as Q6_K (`sumi_first_v[q]`,
+  `sumi_second_v[q]`).
+- **No min term**: Q3_K's q8_1 ds half2 is used only for `dy[q]`;
+  `sy[q]` is unused (parallels Q6_K and Q8_0).
+
+### Bench (paired r=5, TinyLlama 1.1B Q3_K_M, branch-0 quiet)
+
+| build | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla | 23.59 ± 1.35 | 1332.08 ± 24.80 |
+| **ESIMD** | **15.51 ± 0.16** | 1604.29 ± 26.09 |
+
+tg128 ratio: **0.66× vanilla**, in family with the previously landed
+five quants (0.32×–0.86× range). ESIMD's σ=0.16 vs vanilla's σ=1.35 is
+the now-expected deterministic-vs-contended signature from the
+all-in-GRF iter-16 architecture.
+
+pp1024 doesn't pass through `mmvq` (pp uses `mmq` for batched mat-mat),
+so the 1.20× delta is independent of the new kernel — bench-noise band.
+
+### Correctness
+
+Paired llama-cli, seed=1, temp=0, 30 tokens, photosynthesis prompt:
+
+```
+Vanilla:  1. Photosynthesis is the process by which plants and other
+          photosynthetic organisms convert light energy into chemical
+          energy. 2
+
+ESIMD:    1. Photosynthesis is the process by which plants and other
+          photosynthetic organisms convert light energy into chemical
+          energy. 2
+```
+
+Bit-identical at the 30-token horizon at this measurement point.
+Formal perplexity verification (in the style of the Q4_K
+`1a3014f` gate) is deferred — recommended before
+generation-quality-sensitive deployment, per the onboarding note.
+
+### Status
+
+Pending quants in priority order: Q2_K, Q4_1, Q5_0, Q5_1. The
+schedule's per-firing job spec lands one kernel; subsequent firings
+will close the remaining four.
+

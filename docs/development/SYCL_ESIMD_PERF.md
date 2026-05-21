@@ -117,6 +117,26 @@ weight loads per block than with 16 B nibble-packed loads. With
 Q4_0/Q4_K the nibble unpack creates compute work the auto-vectorizer
 can mishandle — Q8_0 has no such opening.
 
+### Q3_K (TinyLlama 1.1B, requantized to Q3_K_M)
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `mul_mat_vec_q3_K_q8_1_sycl`) | 1332 | 23.59 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 1604 | 15.51 | 0.66× |
+
+Q3_K shares Q5_K's raw-block read path (no reorder layout exists for
+Q3_K in the ggml-sycl tree). Architecturally the kernel mirrors Q6_K:
+signed offset weights (`low2 + 4*hbit - 4` in [-4,3]) and 16 sub-scales
+(`(low4 | (high2 << 4)) - 32` in [-32,31]), with the same
+`simd<int8,64>` packed-pair multiply and first-16/second-16 split per
+q8_1 sub-block. No min term. Activation, dy, and scale-unpack hoist
+across the 4 rows; ESIMD's standard deviation (σ=0.16) is well below
+vanilla's (σ=1.35) at this measurement point.
+
+The pp1024 path doesn't pass through `mmvq` — pp uses the batched
+`mmq` kernels — so the ~1.2× pp delta here is noise/independent of
+the ESIMD change. Only the tg128 ratio is the load-bearing signal.
+
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
 

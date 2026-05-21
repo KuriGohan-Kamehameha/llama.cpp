@@ -916,4 +916,208 @@ void reorder_mul_mat_vec_q8_0_q8_1_sycl_esimd(
 }
 
 
+
+// =========================================================================
+// Q3_K — 3-bit K-quant (raw block layout, no reorder).
+//
+// block_q3_K = 110 bytes:
+//   hmask[QK_K/8] = 32 B  (high bit per weight, bit-packed)
+//   qs   [QK_K/4] = 64 B  (low 2 bits per weight, bit-packed)
+//   scales[12]              (16 sub-scales, 6-bit packed: low4 in 0..7, high2 in 8..11)
+//   d    (ggml_half)        (super-block delta)
+//
+// Layout (from ggml-quants.c dequantize_row_q3_K):
+//   For output position l = 128*n + 32*j + 16*half + k  (n in {0,1}, j in 0..3,
+//   half in {0,1}, k in 0..15):
+//     low2(l)  = (qs[32*n + 16*half + k] >> (2*j)) & 0x3
+//     hbit(l)  = (hmask[16*half + k] >> (4*n + j)) & 0x1
+//     signed   = low2(l) + 4*hbit(l) - 4    in [-4, 3]
+//
+// Per q8_1 sub-block q (q in 0..7, covering outputs q*32 .. q*32+31), we have
+// n = q/4, j = q%4, and the 32 weights split into low-16 (half=0) and high-16
+// (half=1). 32 weights map to qs bytes [q_qs_off .. q_qs_off+31] with bit shift
+// q_shift = 2*(q%4), and hmask byte index = same 0..31 range, bit position q.
+//
+// 16 signed sub-scales (range -32..31): scale[2*q] applies to low-16,
+// scale[2*q+1] to high-16. No min term — Q3_K only uses dy from q8_1's ds.
+//
+// Pattern follows Q6_K (signed offset, no min) and Q5_K (raw-block load,
+// bit-extract from a mask byte).
+// =========================================================================
+
+template <int VEC_W>
+static void esimd_q3_k_kernel(
+        const void * __restrict__ vx,
+        const void * __restrict__ vy,
+        float * __restrict__ dst,
+        const int ncols, const int nrows,
+        const sycl::nd_item<1> & nd_item) SYCL_ESIMD_KERNEL {
+
+    const int thread_id = nd_item.get_global_id(0);
+    const int row_base  = thread_id * ROWS_PER_THREAD;
+    if (row_base >= nrows) return;
+
+    const int n_sblocks = ncols / QK_K;
+
+    // block_q3_K is 110 bytes: hmask(32) | qs(64) | scales(12) | d(2)
+    constexpr int BLOCK_BYTES  = (QK_K / 8) + (QK_K / 4) + 12 + sizeof(ggml_half);
+    constexpr int OFF_HMASK    = 0;
+    constexpr int OFF_QS       = QK_K / 8;               // 32
+    constexpr int OFF_SCALES   = OFF_QS + (QK_K / 4);    // 96
+    constexpr int OFF_D        = OFF_SCALES + 12;        // 108
+    static_assert(BLOCK_BYTES == 110, "block_q3_K size assumption");
+
+    const auto * x_base = static_cast<const uint8_t *>(vx);
+
+    // q8_1 activation y: [ncols int8 quants] [(ncols/QK8_1) sycl::half2 ds]
+    const auto * y_qs = static_cast<const int8_t *>(vy);
+    const auto * y_ds = reinterpret_cast<const sycl::half2 *>(
+        static_cast<const uint8_t *>(vy) + ncols);
+
+    float acc[ROWS_PER_THREAD] = { 0.0f };
+
+    for (int sb = 0; sb < n_sblocks; ++sb) {
+        // Activation load — shared across all rows in this thread.
+        esimd::simd<int8_t, 256> y_q_shared;
+        y_q_shared.copy_from(y_qs + sb * QK_K);
+
+        constexpr int N_Y_DS = QK_K / QK8_1;  // 8
+        const uint16_t * y_ds_u16 =
+            reinterpret_cast<const uint16_t *>(y_ds + sb * N_Y_DS);
+
+        // Per-q8_1-sub-block dy. Q3_K has no min term (no sy use).
+        esimd::simd<float, 8> dy_v;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            dy_v[i] = static_cast<float>(sycl::bit_cast<sycl::half>(y_ds_u16[i * 2]));
+        }
+
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+            const int row = row_base + r;
+            if (row >= nrows) break;
+            const int block_idx = row * n_sblocks + sb;
+            const auto * blk = x_base + block_idx * BLOCK_BYTES;
+
+            // Per-row weight loads.
+            esimd::simd<uint8_t, 32> hmask_v;
+            hmask_v.copy_from(blk + OFF_HMASK);
+
+            esimd::simd<uint8_t, 64> qs_v;
+            qs_v.copy_from(blk + OFF_QS);
+
+            esimd::simd<uint8_t, 12> scales_v;
+            scales_v.copy_from(blk + OFF_SCALES);
+
+            // Super-block delta d.
+            const uint16_t * d_u16 = reinterpret_cast<const uint16_t *>(blk + OFF_D);
+            const float d_f = static_cast<float>(sycl::bit_cast<sycl::half>(*d_u16));
+
+            // Unpack 16 signed sub-scales: 6-bit unsigned scale[i] then -32 offset.
+            //   low 4 bits : scales[i & 7] >> ((i >> 3) * 4)
+            //   high 2 bits: scales[8 + (i & 3)] >> ((i >> 2) * 2)
+            //   signed     : (low | (high << 4)) - 32
+            uint8_t s[12];
+            #pragma unroll
+            for (int k = 0; k < 12; ++k) s[k] = scales_v[k];
+
+            esimd::simd<float, 16> sc_f;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const uint8_t lo = (s[i & 7]        >> ((i >> 3) * 4)) & uint8_t(0x0F);
+                const uint8_t hi = (s[8 + (i & 3)]  >> ((i >> 2) * 2)) & uint8_t(0x03);
+                const int8_t sc = static_cast<int8_t>(static_cast<int>(lo | (hi << 4)) - 32);
+                sc_f[i] = static_cast<float>(sc);
+            }
+
+            // Per q8_1 sub-block sumi values (first-16 / second-16 of 32).
+            esimd::simd<float, 8> sumi_first_v;
+            esimd::simd<float, 8> sumi_second_v;
+
+            // 8 q8_1 sub-blocks, 32 weights each. For sub-block q:
+            //   n = q / 4, j = q % 4
+            //   qs slice base = 32 * n  (32 bytes, low-16 + high-16 stacked)
+            //   qs bit shift  = 2 * j
+            //   hmask bit     = q   (covers both halves through hmask[0..15] + hmask[16..31])
+            #pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const int q_qs_offset = (q < 4) ? 0 : 32;
+                const int q_shift     = (q & 3) * 2;
+
+                // 32 packed bytes of qs (low-16 weights from bytes 0..15, high-16 from 16..31).
+                esimd::simd<uint8_t, 32> qs_slice = qs_v.template select<32, 1>(q_qs_offset);
+
+                // Low 2 bits per byte at this q's shift.
+                esimd::simd<int8_t, 32> w_low =
+                    (qs_slice >> uint8_t(q_shift)) & uint8_t(0x03);
+
+                // High bit per weight from hmask: bit q of each of 32 hmask bytes.
+                esimd::simd<int8_t, 32> hbit =
+                    (hmask_v >> uint8_t(q)) & uint8_t(0x01);
+
+                // signed = low + 4*hbit - 4    (hbit=0 → low-4; hbit=1 → low)
+                esimd::simd<int8_t, 32> w_chunk = w_low + (hbit << 2) - int8_t(4);
+
+                // Activation chunk: y_q_shared[q*32 .. q*32+31] is laid out output-major,
+                // matching weight output positions.
+                esimd::simd<int8_t, 32> y_chunk =
+                    y_q_shared.template select<32, 1>(q * 32);
+
+                esimd::simd<int16_t, 32> prod = w_chunk * y_chunk;
+
+                // Split first-16 / second-16 for the 2 sub-scales (2*q, 2*q+1).
+                esimd::simd<int16_t, 16> prod_a = prod.template select<16, 1>(0);
+                esimd::simd<int16_t, 16> prod_b = prod.template select<16, 1>(16);
+
+                sumi_first_v [q] =
+                    static_cast<float>(esimd::reduce<int>(prod_a, std::plus<>{}));
+                sumi_second_v[q] =
+                    static_cast<float>(esimd::reduce<int>(prod_b, std::plus<>{}));
+            }
+
+            // Pack scales: sc_f[2*q] for first-16, sc_f[2*q+1] for second-16.
+            esimd::simd<float, 8> sc_first_v;
+            esimd::simd<float, 8> sc_second_v;
+            #pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                sc_first_v [q] = sc_f[2 * q];
+                sc_second_v[q] = sc_f[2 * q + 1];
+            }
+
+            // contrib[q] = (sc_first[q]*sumi_first[q] + sc_second[q]*sumi_second[q]) * dy[q]
+            const esimd::simd<float, 8> contrib =
+                (sc_first_v * sumi_first_v + sc_second_v * sumi_second_v) * dy_v;
+            acc[r] += d_f * esimd::reduce<float>(contrib, std::plus<>{});
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+        const int row = row_base + r;
+        if (row < nrows) {
+            dst[row] = acc[r];
+        }
+    }
+}
+
+void mul_mat_vec_q3_k_q8_1_sycl_esimd(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+
+    constexpr int WG_SIZE = 32;
+    const int n_threads = (nrows + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD;
+    const sycl::range<1> global_size((n_threads + WG_SIZE - 1) / WG_SIZE * WG_SIZE);
+    const sycl::range<1> workgroup_size(WG_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(global_size, workgroup_size),
+            [=](sycl::nd_item<1> nd_item) SYCL_ESIMD_KERNEL {
+                esimd_q3_k_kernel<32>(vx, vy, dst, ncols, nrows, nd_item);
+            });
+    });
+}
+
+
 #endif  // GGML_SYCL_ESIMD
