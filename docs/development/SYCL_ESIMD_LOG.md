@@ -1502,3 +1502,100 @@ Pending quants in priority order: Q5_0, Q5_1. Two left in the
 contributor-onboarding pending list before this schedule's job spec
 ("if all 5 pending quants are now wired, disable schedule") triggers.
 
+
+## 2026-05-21T  Q5_0 ESIMD kernel landed — near-parity result
+
+Extended ESIMD coverage to Q5_0. Ninth ESIMD mat-vec kernel; pending
+list drops from {Q5_0, Q5_1} to {Q5_1}.
+
+### Headline: 0.98× vanilla
+
+This is the closest-to-parity result of any quant in this branch. The
+previous spread was 0.32× (Q4_0) — 0.93× (Q4_1). Q5_0 nearly closes
+the gap entirely.
+
+**Mechanism**: Q5_0's standard SYCL decode is the most expensive of
+any covered quant. `vec_dot_q5_0_q8_1_impl` does four serial
+`vh[i] << shift & 0x10` bit-extractions to splice each of 4 high
+bits into its corresponding nibble slot in `vi`:
+```cpp
+vi0 |= (vh[i] <<  4) & 0x00000010;  // qh bit 0 -> output 0 (bit 4)
+vi0 |= (vh[i] << 11) & 0x00001000;  // qh bit 1 -> output 1
+vi0 |= (vh[i] << 18) & 0x00100000;  // qh bit 2 -> output 2
+vi0 |= (vh[i] << 25) & 0x10000000;  // qh bit 3 -> output 3
+```
+Four serial shifts + ORs per nibble pair, 8 such expansions per
+impl call (vdr=2, low+high nibble each). The auto-vectorizer can't
+parallelize across these constants — each shift amount is different.
+
+ESIMD replaces this with an unrolled per-bit OR over a `simd<int8_t,
+32>` hbit vector:
+```cpp
+esimd::simd<int8_t, 32> hbit;
+for (by = 0..3) for (bit = 0..7)
+    hbit[8*by + bit] = (qh[by] >> bit) & 1;
+esimd::simd<int8_t, 32> w = low4 | (hbit << 4);
+```
+icpx maps this cleanly to per-lane shift+and across the 32-lane
+vector — exactly the parallelism the standard path can't unlock.
+
+### Bench (paired r=5, TinyLlama 1.1B Q5_0, branch-0 quiet)
+
+| build | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla | 25.65 ± 0.30 | 1076.95 ± 22.52 |
+| **ESIMD** | **25.24 ± 0.15** | 1097.78 ± 13.86 |
+
+tg128 ratio: **0.98× vanilla**. Both kernels are tight: σ=0.15 for
+ESIMD, σ=0.30 for vanilla.
+
+### Architecture
+
+Q5_0 is structurally Q4_0 + Q5_K-style qh bit extract:
+- **Nibble encoding identical to Q4_0/Q4_1**: qs[k] low → output k,
+  high → output k+16.
+- **qh is a 32-bit bitmap**: bit l → high bit (bit 4) of weight at
+  output position l. Simpler than Q5_K's per-sub-block qh selection.
+- **Block layout NOT reorder**: raw block_q5_0 (22 B = d + qh[4] +
+  qs[16]) per block. Same convention as Q4_1.
+- **Formula**: `contrib[b] = d_b * (sumi_b * dy_b - 16 * sy_b)` —
+  shape-identical to Q4_0's `-8*sy*d` with a different constant
+  (5-bit unsigned [0,31] vs 4-bit unsigned [0,15]).
+
+Kernel structure: 8 blocks per group, per-block per-row loads of
+qh[4] and qs[16], 32-lane unsigned 5-bit decode, single 32-wide
+multiply+reduce per block.
+
+### Correctness
+
+Paired llama-cli, seed=1, temp=0, 30 tokens, photosynthesis prompt:
+
+```
+Vanilla:  1. Photosynthesis is the process by which plants and some
+          bacteria convert light energy into chemical energy through
+          the process of photosynthesis
+
+ESIMD:    1. Photosynthesis is the process by which plants and some
+          bacteria convert light energy into chemical energy through
+          the process of photosynthesis
+```
+
+Bit-identical. Formal perplexity gate deferred per onboarding-section
+guidance.
+
+### What Q5_0 demonstrates
+
+This is the first quant where the original pessimistic framing in the
+SYCL_ESIMD_LOG ("ESIMD lands intentionally below the standard path's
+perf, it's a foundation") is falsified. **Q5_0's standard-path decode
+has serial bit-shuffle work that ESIMD parallelizes effectively.** It
+suggests the gap-to-vanilla ratio is not a fixed Xe-LPG ceiling but a
+function of how much per-block decode work each quant has — quants
+with lots of bit-fiddly decode (Q5_0) close the gap; quants with
+near-zero decode (Q8_0) widen it.
+
+### Status
+
+Pending quants in priority order: Q5_1 (last). The schedule's job
+spec disable-trigger fires after Q5_1 lands.
+

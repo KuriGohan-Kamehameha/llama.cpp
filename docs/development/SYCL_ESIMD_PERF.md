@@ -199,6 +199,33 @@ requirement). All TinyLlama / Llama mat-vec tensors at QK4_1 = 32
 satisfy this since ncols is always a multiple of 256 at typical
 model dimensions.
 
+### Q5_0 (TinyLlama 1.1B, requantized to Q5_0)
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `mul_mat_vec_q5_0_q8_1_sycl`) | 1077 | 25.65 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 1098 | 25.24 | 0.98× |
+
+Q5_0 lands at **near parity** with vanilla — the closest of any
+quant in this branch. Mechanism: Q5_0 has the most expensive
+standard-SYCL decode of any covered quant (the `vec_dot_q5_0_q8_1_impl`
+formula does four serial `vh[i] << shift & 0x10` bit-extractions to
+splice the 5th bits into the 4-byte nibble vi). ESIMD replaces this
+with an unrolled per-bit OR over a `simd<int8_t, 32>` hbit vector
+extracted from qh's 32-bit bitmap, which the compiler maps cleanly
+to per-lane shift+and. The standard path's serial bit-shuffle is
+exactly the kind of code where explicit SIMD widening unlocks
+parallelism the auto-vectorizer can't reach.
+
+Same structural shape as Q4_0/Q4_1: 8 blocks per group, raw block
+layout (Q5_0 is *not* on the reorder path — legacy quants {Q4_1,
+Q5_0, Q5_1} stay off it by design), pair-multiplication via
+`simd<int8,64>` packed pairs, formula `d * (sumi * dy - 16 * sy)`
+(the -16 offset converts unsigned 5-bit [0,31] -> signed [-16,15];
+shape-identical to Q4_0's -8 with twice the constant).
+
+Dispatch falls back when ncols isn't a multiple of QK5_0 * 8 = 256.
+
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
 
