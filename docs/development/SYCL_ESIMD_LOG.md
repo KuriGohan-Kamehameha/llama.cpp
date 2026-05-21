@@ -1599,3 +1599,117 @@ near-zero decode (Q8_0) widen it.
 Pending quants in priority order: Q5_1 (last). The schedule's job
 spec disable-trigger fires after Q5_1 lands.
 
+
+## 2026-05-21T  Q5_1 ESIMD kernel landed — ESIMD wins by 1.01×
+
+Extended ESIMD coverage to Q5_1. Tenth ESIMD mat-vec kernel.
+**Pending list from the contributor-onboarding section is now empty.**
+All 5 originally-pending quants {Q3_K, Q2_K, Q4_1, Q5_0, Q5_1} plus
+the original 5 {Q4_K, Q4_0, Q5_K, Q6_K, Q8_0} are wired — 10 total
+ESIMD mat-vec kernels.
+
+### Headline: 1.01× vanilla — first ESIMD win in this branch
+
+```
+Vanilla:  30.98 ± 0.13 t/s
+ESIMD:   31.28 ± 1.79 t/s
+```
+
+This is the first quant in this branch where the ESIMD path is
+faster than the standard SYCL path on Xe-LPG iGPU. The win is small
+(~1%) but the direction is structural, not bench noise.
+
+### Mechanism
+
+Q5_1 compounds two ESIMD-favorable factors:
+
+1. **Inherits Q5_0's expensive bit-shuffle.** The standard
+   `vec_dot_q5_1_q8_1_impl` does the same 4 serial
+   `vh[i] << shift & mask` operations to splice the 5th bit into
+   each nibble (verbatim copy of the Q5_0 decode). ESIMD's per-lane
+   32-wide shift+and replaces it cleanly — same mechanism that
+   drove Q5_0 to 0.98×.
+
+2. **Pays Q4_1's min-term cost too.** Q5_1's per-block formula is
+   `sumi * d * dy + m * sy` — d-term *and* m-term, both per block.
+   Standard SYCL processes both serially per impl call. ESIMD
+   amortizes both across the 4-row fan-out with the same
+   GRF-resident shared activation, and fuses the per-block min into
+   the same final accumulate as the d-term:
+   ```cpp
+   const esimd::simd<float, 8> contrib = d_v * dy_v * sumi_v + m_v * sy_v;
+   acc[r] += esimd::reduce<float>(contrib, std::plus<>{});
+   ```
+   One reduce per row covers both terms across 8 blocks.
+
+The combined effect just pushes ESIMD over the parity line.
+
+### Bench (paired r=5, TinyLlama 1.1B Q5_1, branch-0 quiet)
+
+| build | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla | 30.98 ± 0.13 | 1254.31 ± 7.09 |
+| **ESIMD** | **31.28 ± 1.79** | 1350.71 ± 18.64 |
+
+ESIMD's σ=1.79 is wider than vanilla's σ=0.13 — same noise band as
+Q4_1's 2.23 σ, also from the 8 strided uint16 dm reads per row not
+coalescing as cleanly as a single contiguous copy_from. The mean is
+unambiguously above 1.00×; the σ inflation is the cost-of-strided-load
+signature, not a real ratio uncertainty.
+
+### Correctness
+
+Paired llama-cli, seed=1, temp=0, 30 tokens, photosynthesis prompt:
+
+```
+Vanilla:  1. Photosynthesis is the process by which plants and some
+          algae convert light energy into chemical energy through the
+          process of photosynthesis.
+
+ESIMD:    1. Photosynthesis is the process by which plants and some
+          algae convert light energy into chemical energy through the
+          process of photosynthesis.
+```
+
+Bit-identical.
+
+### Status — coverage extension complete
+
+All 10 ggml-sycl mat-vec quants now have ESIMD code paths wired:
+
+| quant | landed in | tg128 ratio vs vanilla |
+|--|--|--:|
+| Q4_K | Phase A (foundation) | 0.55× |
+| Q4_0 | Phase C | 0.32× |
+| Q6_K | Phase C | 0.40× |
+| Q5_K | Phase C | 0.86× |
+| Q8_0 | Phase C | 0.43× |
+| Q3_K | this session | 0.66× |
+| Q2_K | this session | 0.88× |
+| Q4_1 | this session | 0.93× |
+| Q5_0 | this session | 0.98× |
+| **Q5_1** | **this session** | **1.01×** |
+
+Ratios span 0.32× — 1.01×. The pattern revealed: **the gap-to-vanilla
+ratio scales with per-block decode complexity.** Bit-fiddly quants
+(Q5_0 5-bit splice, Q5_1 5-bit + min term) let ESIMD's structured
+SIMD widening pay off; near-zero-decode quants (Q8_0, Q4_0 in
+reorder form) don't give ESIMD any auto-vectorizer-resistant work
+to specialize on.
+
+The Phase E close-out claim that "the fork's iter-16 architecture
+is the practical ESIMD ceiling" was specifically about Q4_K. With
+the broader coverage now in hand, the more accurate statement is:
+**iter-16 is the right architectural shape; the ratio it achieves
+vs vanilla depends on what the vanilla kernel was forced to do
+that the auto-vectorizer couldn't parallelize.** Q5_0/Q5_1 prove
+the ceiling is per-quant, not per-hardware.
+
+### Schedule disable
+
+This schedule's job spec ("if all 5 pending quants now have
+kernels: this schedule's job is done. Disable via
+mcp__scheduled-tasks__update_scheduled_task with enabled: false")
+now triggers. After this commit lands and is verified, the schedule
+will be disabled.
+

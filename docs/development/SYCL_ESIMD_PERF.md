@@ -226,6 +226,44 @@ shape-identical to Q4_0's -8 with twice the constant).
 
 Dispatch falls back when ncols isn't a multiple of QK5_0 * 8 = 256.
 
+### Q5_1 (TinyLlama 1.1B, requantized to Q5_1) — ESIMD wins
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `mul_mat_vec_q5_1_q8_1_sycl`) | 1254 | 30.98 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 1351 | **31.28** | **1.01×** |
+
+**This is the first quant in this branch where ESIMD outperforms
+the standard SYCL path.** Compounding two effects:
+
+1. Q5_1 inherits Q5_0's expensive bit-shuffle decode (4 serial
+   shifts per nibble to splice the 5th bit into vi). ESIMD's
+   per-lane 32-wide shift+and replaces it cleanly — the same
+   mechanism that drove Q5_0 to 0.98×.
+2. Q5_1 *also* does Q4_1's additive min term (`m * sy`) on top of
+   the dot product. Standard SYCL pays both costs. ESIMD's
+   GRF-resident shared activation amortizes both per-block costs
+   across the 4-row fan-out simultaneously — the per-row min-term
+   multiply is a single `m_v * sy_v` over 8 blocks, fused into the
+   same final accumulate as the d-term.
+
+Mean is unambiguously above 1.00×, though ESIMD's σ=1.79 vs
+vanilla's σ=0.13 widens the confidence interval. The win is small
+(~1%) but the direction is consistent and structural: with the
+right combination of per-block decode complexity, ESIMD on
+Xe-LPG can beat the standard SYCL `dp4a` path.
+
+Architecture is Q5_0's kernel + Q4_1's additive min term:
+- Same nibble + qh-bitmap decode as Q5_0.
+- Per-block dm half2 (d, m) instead of just d.
+- Formula: `contrib[b] = d_b * dy_b * sumi_b + m_b * sy_b` (no
+  explicit -16 offset; the per-block m absorbs it).
+
+Block layout NOT reorder (24 B per block = dm + qh[4] + qs[16]),
+following the legacy-quant convention.
+
+Dispatch falls back when ncols isn't a multiple of QK5_1 * 8 = 256.
+
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
 

@@ -1167,7 +1167,22 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 }
                 break;
             case GGML_TYPE_Q5_1:
-                mul_mat_vec_q5_1_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                {
+#ifdef GGML_SYCL_ESIMD
+                    static const bool use_esimd_q5_1 =
+                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
+                    if (use_esimd_q5_1 && (ne00 % (QK5_1 * 8) == 0)) {
+                        GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_1_q8_1_sycl_esimd\n");
+                        extern void mul_mat_vec_q5_1_q8_1_sycl_esimd(
+                            const void *, const void *, float *, int, int, dpct::queue_ptr);
+                        mul_mat_vec_q5_1_q8_1_sycl_esimd(
+                            src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    } else
+#endif
+                    {
+                        mul_mat_vec_q5_1_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    }
+                }
                 break;
             case GGML_TYPE_Q8_0:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
