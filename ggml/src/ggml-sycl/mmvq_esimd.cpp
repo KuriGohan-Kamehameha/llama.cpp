@@ -1340,4 +1340,174 @@ void mul_mat_vec_q2_k_q8_1_sycl_esimd(
 }
 
 
+
+// =========================================================================
+// Q4_1 — 4-bit legacy quant with per-block min (raw block layout).
+//
+// block_q4_1 = 20 bytes:
+//   dm = (d, m) ggml_half2          (4 B)
+//   qs[QK4_1/2] = qs[16]             (16 B)  — nibbles, 2 weights per byte
+//
+// Weight decode (same nibble layout as Q4_0):
+//   For block b, output position l in 0..31:
+//     k = l & 0xF
+//     w[l] = (qs[k] >> ((l < 16) ? 0 : 4)) & 0x0F     unsigned [0, 15]
+//   i.e. qs[k] low nibble  -> weight at output l = k        (k = 0..15)
+//        qs[k] high nibble -> weight at output l = k + 16
+//
+// Per-block formula (mirrors vec_dot_q4_1_q8_1_impl):
+//   contrib[b] = d_b * dy_b * sumi_b + m_b * sy_b
+// where sumi_b = sum_{l=0..31}(w[l] * u_l) (int dot, unsigned weights),
+//       sy_b = sum_{l=0..31}(d_y * u_l) precomputed in q8_1.ds[1].
+//
+// Q4_1 each block is exactly 32 weights = one q8_1 sub-block. We process
+// 8 blocks per super-iteration so the 256-byte y_q_shared activation
+// load aligns with 8 q8_1 sub-blocks (matches Q4_0 / Q8_0).
+//
+// Pattern: Q4_0's group-of-8-blocks structure (same nibble decode,
+// same pair-of-blocks multiplication) with Q4_K-style additive
+// min term replacing the -8*sy offset.
+// =========================================================================
+
+template <int VEC_W>
+static void esimd_q4_1_kernel(
+        const void * __restrict__ vx,
+        const void * __restrict__ vy,
+        float * __restrict__ dst,
+        const int ncols, const int nrows,
+        const sycl::nd_item<1> & nd_item) SYCL_ESIMD_KERNEL {
+
+    const int thread_id = nd_item.get_global_id(0);
+    const int row_base  = thread_id * ROWS_PER_THREAD;
+    if (row_base >= nrows) return;
+
+    constexpr int Q41_BLOCKS_PER_GROUP = 8;     // 8 blocks * 32 weights = 256
+    constexpr int BLOCK_BYTES          = 2 * sizeof(ggml_half) + (QK4_1 / 2);  // 20
+    constexpr int OFF_QS               = 2 * sizeof(ggml_half);                // 4
+    constexpr int GROUP_BYTES          = Q41_BLOCKS_PER_GROUP * BLOCK_BYTES;    // 160
+    constexpr int GROUP_Y_QS_BYTES     = Q41_BLOCKS_PER_GROUP * QK4_1;          // 256
+
+    static_assert(BLOCK_BYTES == 20, "block_q4_1 size assumption");
+
+    const int n_blocks_per_row = ncols / QK4_1;
+    const int n_groups         = n_blocks_per_row / Q41_BLOCKS_PER_GROUP;
+
+    const auto * x_base = static_cast<const uint8_t *>(vx);
+
+    // q8_1 activation y: [ncols int8 quants] [(ncols/QK8_1) sycl::half2 ds]
+    const auto * y_qs    = static_cast<const int8_t *>(vy);
+    const auto * y_ds_u8 = static_cast<const uint8_t *>(vy) + ncols;
+
+    float acc[ROWS_PER_THREAD] = { 0.0f };
+
+    for (int g = 0; g < n_groups; ++g) {
+        // Activation load — shared across all rows in this thread.
+        esimd::simd<int8_t, 256> y_q_shared;
+        y_q_shared.copy_from(y_qs + g * GROUP_Y_QS_BYTES);
+
+        // Per-q8_1-sub-block dy and sy (one (d,s) pair per block — Q4_1
+        // blocks are 1:1 with q8_1 sub-blocks).
+        const uint16_t * y_ds_u16 = reinterpret_cast<const uint16_t *>(
+            y_ds_u8 + g * Q41_BLOCKS_PER_GROUP * sizeof(sycl::half2));
+        esimd::simd<float, 8> dy_v, sy_v;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            dy_v[i] = static_cast<float>(sycl::bit_cast<sycl::half>(y_ds_u16[i * 2]));
+            sy_v[i] = static_cast<float>(sycl::bit_cast<sycl::half>(y_ds_u16[i * 2 + 1]));
+        }
+
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+            const int row = row_base + r;
+            if (row >= nrows) break;
+
+            const auto * group_base =
+                x_base + (row * n_blocks_per_row + g * Q41_BLOCKS_PER_GROUP) * BLOCK_BYTES;
+
+            // Per-block d and m (8 of each). Q4_1's dm is at byte 0 of each
+            // 20-byte block — strided uint16 reads.
+            esimd::simd<float, 8> d_v, m_v;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const uint16_t * dm_u16 = reinterpret_cast<const uint16_t *>(
+                    group_base + i * BLOCK_BYTES);
+                d_v[i] = static_cast<float>(sycl::bit_cast<sycl::half>(dm_u16[0]));
+                m_v[i] = static_cast<float>(sycl::bit_cast<sycl::half>(dm_u16[1]));
+            }
+
+            // sumi per block: int4 nibble dot int8 activations.
+            // Process 2 blocks per pair (64 weights) to bound GRF pressure —
+            // matches Q4_0's structure exactly. Each pair loads 2 separate
+            // 16-byte qs slices (since blocks are not contiguous in raw
+            // layout, unlike Q4_0's reorder).
+            esimd::simd<float, 8> sumi_v;
+            #pragma unroll
+            for (int sub = 0; sub < 8; sub += 2) {
+                // 16 bytes of qs per block.
+                esimd::simd<uint8_t, 16> qs0;
+                qs0.copy_from(group_base +  sub      * BLOCK_BYTES + OFF_QS);
+                esimd::simd<uint8_t, 16> qs1;
+                qs1.copy_from(group_base + (sub + 1) * BLOCK_BYTES + OFF_QS);
+
+                // Block `sub`: byte k -> weight k (low) and weight k+16 (high).
+                esimd::simd<int8_t, 16> w0_lo = qs0 & uint8_t(0x0F);
+                esimd::simd<int8_t, 16> w0_hi = (qs0 >> 4) & uint8_t(0x0F);
+                // Block `sub+1`: same.
+                esimd::simd<int8_t, 16> w1_lo = qs1 & uint8_t(0x0F);
+                esimd::simd<int8_t, 16> w1_hi = (qs1 >> 4) & uint8_t(0x0F);
+
+                esimd::simd<int8_t, 64> w_pair;
+                w_pair.template select<16, 1>(0)  = w0_lo;
+                w_pair.template select<16, 1>(16) = w0_hi;
+                w_pair.template select<16, 1>(32) = w1_lo;
+                w_pair.template select<16, 1>(48) = w1_hi;
+
+                esimd::simd<int8_t, 64> y_pair;
+                y_pair.template select<32, 1>(0)  = y_q_shared.template select<32, 1>(sub       * 32);
+                y_pair.template select<32, 1>(32) = y_q_shared.template select<32, 1>((sub + 1) * 32);
+
+                esimd::simd<int16_t, 64> prod_pair = w_pair * y_pair;
+
+                esimd::simd<int16_t, 32> prod_b0 = prod_pair.template select<32, 1>(0);
+                esimd::simd<int16_t, 32> prod_b1 = prod_pair.template select<32, 1>(32);
+
+                sumi_v[sub]     = static_cast<float>(esimd::reduce<int>(prod_b0, std::plus<>{}));
+                sumi_v[sub + 1] = static_cast<float>(esimd::reduce<int>(prod_b1, std::plus<>{}));
+            }
+
+            // Per-block contrib: d * dy * sumi + m * sy
+            const esimd::simd<float, 8> contrib = d_v * dy_v * sumi_v + m_v * sy_v;
+            acc[r] += esimd::reduce<float>(contrib, std::plus<>{});
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+        const int row = row_base + r;
+        if (row < nrows) {
+            dst[row] = acc[r];
+        }
+    }
+}
+
+void mul_mat_vec_q4_1_q8_1_sycl_esimd(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % (QK4_1 * 8) == 0);  // need multiple of 8 blocks per row
+
+    constexpr int WG_SIZE = 32;
+    const int n_threads = (nrows + ROWS_PER_THREAD - 1) / ROWS_PER_THREAD;
+    const sycl::range<1> global_size((n_threads + WG_SIZE - 1) / WG_SIZE * WG_SIZE);
+    const sycl::range<1> workgroup_size(WG_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(global_size, workgroup_size),
+            [=](sycl::nd_item<1> nd_item) SYCL_ESIMD_KERNEL {
+                esimd_q4_1_kernel<32>(vx, vy, dst, ncols, nrows, nd_item);
+            });
+    });
+}
+
+
 #endif  // GGML_SYCL_ESIMD

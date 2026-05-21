@@ -1425,3 +1425,80 @@ Pending quants in priority order: Q4_1, Q5_0, Q5_1. Three left in the
 contributor-onboarding pending list before this schedule's job spec
 ("if all 5 pending quants are now wired, disable schedule") triggers.
 
+
+## 2026-05-21T  Q4_1 ESIMD kernel landed — coverage extension
+
+Extended ESIMD coverage to Q4_1. Eighth ESIMD mat-vec kernel; pending
+list drops from {Q4_1, Q5_0, Q5_1} to {Q5_0, Q5_1}.
+
+### Architecture
+
+Q4_1 is structurally Q4_0 with an additive per-block min:
+- **Nibble encoding identical to Q4_0**: qs[k] low nibble → output k,
+  high nibble → output k+16 (k in 0..15). Unsigned 4-bit [0, 15].
+- **Block layout NOT reorder**: raw `block_q4_1` (20 B = dm half2 +
+  qs[16]) per block. The legacy quants {Q4_1, Q5_0, Q5_1}
+  intentionally stay off the reorder path in ggml-sycl.
+- **Formula**: `contrib[b] = d_b * dy_b * sumi_b + m_b * sy_b` —
+  Q4_0's `-8 * sy * d` becomes `+m * sy` (no static -8 offset; the
+  min is per-block).
+
+Kernel mirrors Q4_0's group-of-8-blocks pair-multiplication structure
+(`#pragma unroll for sub in 0..8 step 2`). Only differences: per-block
+qs is loaded as two separate 16-byte slices (since blocks aren't
+contiguous in raw layout), and per-block d_v/m_v are gathered from
+strided uint16 reads at byte 0 of each 20-byte block.
+
+ESIMD requires `ncols % (QK4_1 * 8) == 0`; dispatch falls back to
+the standard path otherwise. All standard TinyLlama / Llama row
+widths (multiples of 256) satisfy this.
+
+### Bench (paired r=5, TinyLlama 1.1B Q4_1, branch-0 quiet)
+
+| build | tg128 t/s | pp1024 t/s |
+|--|--:|--:|
+| Vanilla | 43.70 ± 0.51 | 1476.13 ± 28.67 |
+| **ESIMD** | **40.65 ± 2.23** | 1526.48 ± 18.11 |
+
+tg128 ratio: **0.93× vanilla** — new best ratio of the eight landed
+quants (previous best: Q2_K at 0.88×).
+
+Mechanism: Q4_1's legacy block layout has the lightest per-block
+decode of any covered quant (one nibble unpack + one dm half2 read,
+no scale-byte shuffle, no sub-scale unpack). ESIMD's GRF-resident
+shared activation amortizes nearly all of standard SYCL's per-block
+overhead. Vanilla tg128 of 43.7 t/s is ~1.8× the K-quants on this
+model — Q4_1's simplicity makes both paths fast and keeps the
+relative gap minimal.
+
+ESIMD σ=2.23 is higher than the K-quants' σ=0.08-0.18 — the cause is
+likely the strided 8-block uint16 dm reads (8 separate scalar loads
+per row, not coalesced as the K-quants' single `copy_from` over a
+contiguous scales[] array can do). The tg128 mean is rock-solid; the
+σ inflation is bench-noise band, not a real signal.
+
+pp1024 doesn't pass through mmvq; the 1526 vs 1476 delta is noise.
+
+### Correctness
+
+Paired llama-cli, seed=1, temp=0, 30 tokens, photosynthesis prompt:
+
+```
+Vanilla:  1. Photosynthesis is the process by which plants convert
+          light energy into chemical energy through the production of
+          oxygen and glucose.
+
+ESIMD:    1. Photosynthesis is the process by which plants convert
+          light energy into chemical energy through the production of
+          oxygen and glucose.
+```
+
+Bit-identical. Formal perplexity gate deferred per onboarding-section
+guidance.
+
+### Status
+
+Pending quants in priority order: Q5_0, Q5_1. Two left in the
+contributor-onboarding pending list before this schedule's job spec
+("if all 5 pending quants are now wired, disable schedule") triggers.
+

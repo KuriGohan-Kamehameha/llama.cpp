@@ -165,6 +165,40 @@ vanilla's σ=0.11 — the deterministic-vs-contended signature is
 narrowest here because Q2_K's per-row compute is light enough that
 the standard kernel is also nearly contention-free.
 
+### Q4_1 (TinyLlama 1.1B, requantized to Q4_1)
+
+| backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |
+|---|--:|--:|--:|
+| Standard SYCL (default `mul_mat_vec_q4_1_q8_1_sycl`) | 1476 | 43.70 | 1.00× |
+| **ESIMD opt-in** (this branch, `GGML_SYCL_USE_ESIMD=1`) | 1526 | 40.65 | 0.93× |
+
+Q4_1 is structurally Q4_0 with an additive per-block min: nibble
+encoding is identical (qs[k] low → output k, high → output k+16),
+but the contribution formula adds an explicit min term instead of
+the Q4_0 implicit -8 offset:
+
+  `contrib[b] = d_b * dy_b * sumi_b + m_b * sy_b`
+
+The ESIMD kernel mirrors Q4_0's group-of-8-blocks pair-multiplication
+shape. The structural divergence is that Q4_1 is *not* on the reorder
+path — block_q4_1 (dm half2 + qs[16] = 20 bytes) is read raw with
+strided per-block loads. The legacy quants {Q4_1, Q5_0, Q5_1}
+intentionally stay off the reorder path in ggml-sycl.
+
+At **0.93× vanilla** Q4_1 lands as the best ratio of the eight quants
+now covered. Mechanism: the legacy block layout's small per-block
+decode (one nibble unpack + one half2 read for dm) is lightweight
+enough that ESIMD's GRF-resident shared activation amortizes nearly
+all of the standard SYCL path's per-block overhead. Vanilla tg128 of
+43.7 t/s is itself nearly 2× the K-quants on this model — Q4_1's
+simplicity makes both paths fast and keeps their relative gap small.
+
+Dispatch falls back to the standard path when ncols isn't a multiple
+of QK4_1 * 8 = 256 (the ESIMD group-of-8-blocks alignment
+requirement). All TinyLlama / Llama mat-vec tensors at QK4_1 = 32
+satisfy this since ncols is always a multiple of 256 at typical
+model dimensions.
+
 The standard SYCL path is **unchanged** by the new build flag. ESIMD is
 opt-in at runtime via env var; default behavior is unaffected.
 
