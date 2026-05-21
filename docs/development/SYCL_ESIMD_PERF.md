@@ -75,6 +75,38 @@ kernel architecture. If breakthrough exists, it lives in compiler/IGC
 scheduling parameters that differ between icpx and IPEX's toolchain —
 outside source-level control without IGC dump access.
 
+## 2026-05-21 corrigendum — bench numbers below for non-reorder quants were artifacts
+
+The previously-recorded ratios for Q5_K, Q5_0, Q5_1, Q4_1, Q2_K, Q3_K
+were measured **without the ESIMD kernel actually running** for those
+quants. The default SYCL mat-mat-vec dispatch routes those 6 quants
+through DMMV (dequant-then-mat-vec), not MMVQ where ESIMD lives.
+Setting `GGML_SYCL_USE_ESIMD=1` had no effect on the dispatch for those
+quants until the 2026-05-21 dispatch fix landed.
+
+True ESIMD-vs-vanilla ratios after the fix (paired r=3, `-n 64`,
+TinyLlama 1.1B, branch-0 contended):
+
+| quant | vanilla path | vanilla tg | esimd tg | true ratio |
+|---|---|--:|--:|--:|
+| Q3_K_M | DMMV (`to_fp16` + fp16 mat-vec) | 22.75 ± 3.18 | 15.97 ± 0.12 | **0.70×** |
+| Q2_K   | DMMV | 20.09 ± 0.09 | 15.99 ± 0.05 | **0.80×** |
+| Q4_1   | DMMV | 20.25 ± 0.07 | 16.04 ± 0.08 | **0.79×** |
+| Q5_0   | DMMV | 20.30 ± 0.28 | 16.07 ± 0.06 | **0.79×** |
+| Q5_1   | DMMV | 20.13 ± 0.14 | 18.18 ± 0.21 | **0.90×** |
+| Q5_K_M | DMMV | 23.09 ± 0.36 | 18.31 ± 0.06 | **0.79×** |
+
+**No ESIMD kernel in this fork beats its vanilla counterpart on
+Xe-LPG.** The Phase E "structural ceiling" conclusion was Q4_K-specific;
+the broader 10-quant sweep with the dispatch fix shows the ceiling holds
+across every quant.
+
+The 4 reorder-quant ratios in the tables below (Q4_0 / Q8_0 / Q4_K /
+Q6_K, 0.32×–0.55×) are valid — those compare ESIMD vs same-path
+reorder-mmvq, since both code paths go through mmvq.
+
+---
+
 ### Q4_0 (TinyLlama 1.1B)
 
 | backend | pp1024 (t/s) | tg128 (t/s) | tg vs default |

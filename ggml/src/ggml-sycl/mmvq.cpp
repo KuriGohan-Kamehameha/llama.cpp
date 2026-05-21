@@ -7,7 +7,86 @@
 
 #ifdef GGML_SYCL_ESIMD
 #include <cstdlib>  // std::getenv for runtime ESIMD switch
+#include <cctype>
+#include <set>
+#include <string>
+
+// Per-quant ESIMD opt-in.
+//
+// GGML_SYCL_USE_ESIMD env var values (resolved once per process):
+//   <unset> or empty     - all ESIMD kernels disabled (default; backward-compat).
+//   "1" / "all" / "true" - all ESIMD kernels enabled (backward-compat with the
+//                          pre-2026-05-21 single-switch behavior).
+//   "auto"               - enable only kernels that meet or exceed ~0.85x parity
+//                          on the canonical TinyLlama 1.1B bench: the
+//                          {q2_k, q4_1, q5_0, q5_1, q5_k} subset.
+//   comma list, e.g.     - enable only the listed quants. Names are
+//   "q5_1,q5_0,q2_k"       case-insensitive and match the kernel-dispatch
+//                          K-quant / legacy-quant names: q4_0, q4_1, q5_0,
+//                          q5_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k.
+//
+// The standard SYCL path is unchanged when the env var is unset, so default
+// behavior matches earlier builds. Setting GGML_SYCL_USE_ESIMD=1 keeps the
+// pre-existing all-or-nothing semantics.
+
+namespace {
+struct esimd_dispatch_config {
+    bool all_enabled = false;
+    std::set<std::string> enabled_quants;
+
+    esimd_dispatch_config() {
+        const char * env = std::getenv("GGML_SYCL_USE_ESIMD");
+        if (env == nullptr || env[0] == '\0') {
+            return;
+        }
+        std::string s(env);
+        for (auto & c : s) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (s == "1" || s == "all" || s == "true") {
+            all_enabled = true;
+            return;
+        }
+        if (s == "auto") {
+            // As of the 2026-05-21 dispatch-fix re-measure, NO ESIMD kernel
+            // in this fork beats its vanilla counterpart on Xe-LPG. The
+            // raw-block quants (Q5_K, Q5_0, Q5_1, Q4_1, Q3_K, Q2_K) regress
+            // to ~0.70-0.90x of the SYCL DMMV path; the reorder quants
+            // (Q4_0, Q8_0, Q4_K, Q6_K) regress to ~0.32-0.55x of the
+            // reorder-mmvq path. Auto mode therefore enables NOTHING by
+            // default; users opt in by name to study individual kernels.
+            // See SYCL_ESIMD_LOG.md "2026-05-21 corrigendum" entry.
+            return;
+        }
+        // Comma list of quant names.
+        std::size_t start = 0;
+        while (start <= s.size()) {
+            std::size_t end = s.find(',', start);
+            std::size_t len =
+                (end == std::string::npos) ? std::string::npos : end - start;
+            std::string tok = s.substr(start, len);
+            // Trim ASCII whitespace.
+            std::size_t l = tok.find_first_not_of(" \t");
+            std::size_t r = tok.find_last_not_of(" \t");
+            if (l != std::string::npos) {
+                enabled_quants.insert(tok.substr(l, r - l + 1));
+            }
+            if (end == std::string::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+    }
+};
+}  // anonymous namespace
+
+bool esimd_enabled_for(const char * quant_name) {
+    static const esimd_dispatch_config cfg;
+    if (cfg.all_enabled) return true;
+    return cfg.enabled_quants.count(quant_name) > 0;
+}
 #endif
+
 
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
@@ -1108,10 +1187,8 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q4_0 =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
                     // ESIMD kernel needs multiples of 8 Q4_0 blocks per row.
-                    if (use_esimd_q4_0 && (ne00 % (QK4_0 * 8) == 0)) {
+                    if (esimd_enabled_for("q4_0") && (ne00 % (QK4_0 * 8) == 0)) {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_0_q8_1_sycl_esimd\n");
                         extern void reorder_mul_mat_vec_q4_0_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1131,11 +1208,9 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q4_1:
                 {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q4_1 =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
                     // ESIMD requires 8-block-per-row alignment (256 weights/group);
                     // fall back to standard path if ncols not a multiple.
-                    if (use_esimd_q4_1 && (ne00 % (QK4_1 * 8) == 0)) {
+                    if (esimd_enabled_for("q4_1") && (ne00 % (QK4_1 * 8) == 0)) {
                         GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_1_q8_1_sycl_esimd\n");
                         extern void mul_mat_vec_q4_1_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1151,9 +1226,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q5_0:
                 {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q5_0 =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
-                    if (use_esimd_q5_0 && (ne00 % (QK5_0 * 8) == 0)) {
+                    if (esimd_enabled_for("q5_0") && (ne00 % (QK5_0 * 8) == 0)) {
                         GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_0_q8_1_sycl_esimd\n");
                         extern void mul_mat_vec_q5_0_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1169,9 +1242,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q5_1:
                 {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q5_1 =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
-                    if (use_esimd_q5_1 && (ne00 % (QK5_1 * 8) == 0)) {
+                    if (esimd_enabled_for("q5_1") && (ne00 % (QK5_1 * 8) == 0)) {
                         GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_1_q8_1_sycl_esimd\n");
                         extern void mul_mat_vec_q5_1_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1188,10 +1259,8 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q8_0 =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
                     // ESIMD kernel needs multiples of 8 Q8_0 blocks per row.
-                    if (use_esimd_q8_0 && (ne00 % (QK8_0 * 8) == 0)) {
+                    if (esimd_enabled_for("q8_0") && (ne00 % (QK8_0 * 8) == 0)) {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl_esimd\n");
                         extern void reorder_mul_mat_vec_q8_0_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1210,9 +1279,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q2_K:
                 {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q2_k =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
-                    if (use_esimd_q2_k) {
+                    if (esimd_enabled_for("q2_k")) {
                         GGML_SYCL_DEBUG("Calling mul_mat_vec_q2_k_q8_1_sycl_esimd\n");
                         extern void mul_mat_vec_q2_k_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1228,9 +1295,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q3_K:
                 {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q3_k =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
-                    if (use_esimd_q3_k) {
+                    if (esimd_enabled_for("q3_k")) {
                         GGML_SYCL_DEBUG("Calling mul_mat_vec_q3_k_q8_1_sycl_esimd\n");
                         extern void mul_mat_vec_q3_k_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1247,9 +1312,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
-                    if (use_esimd) {
+                    if (esimd_enabled_for("q4_k")) {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl_esimd\n");
                         extern void reorder_mul_mat_vec_q4_k_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1269,9 +1332,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q5_K:
                 {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q5_k =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
-                    if (use_esimd_q5_k) {
+                    if (esimd_enabled_for("q5_k")) {
                         GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_k_q8_1_sycl_esimd\n");
                         extern void mul_mat_vec_q5_k_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);
@@ -1288,9 +1349,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
 #ifdef GGML_SYCL_ESIMD
-                    static const bool use_esimd_q6_k =
-                        std::getenv("GGML_SYCL_USE_ESIMD") != nullptr;
-                    if (use_esimd_q6_k) {
+                    if (esimd_enabled_for("q6_k")) {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q6_k_q8_1_sycl_esimd\n");
                         extern void reorder_mul_mat_vec_q6_k_q8_1_sycl_esimd(
                             const void *, const void *, float *, int, int, dpct::queue_ptr);

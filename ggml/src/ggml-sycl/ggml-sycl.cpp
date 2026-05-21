@@ -3332,6 +3332,36 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
     }
 }
 
+// Per the SYCL_ESIMD_LOG, mmvq.cpp now has ESIMD code paths for all 10
+// quants (4 reorder + 6 raw-block). The default dispatch above routes
+// raw-block quants through DMMV first, which makes those 6 ESIMD
+// kernels unreachable. This helper marks quants that have an ESIMD
+// kernel registered in mmvq.cpp, so the precedence guard below can
+// promote them to the mmvq path when GGML_SYCL_USE_ESIMD is enabled.
+//
+// Returns true for raw-block quants that the user has explicitly
+// opted into via the per-quant env var. Note: this is not just
+// "has an ESIMD kernel" — it's "has an ESIMD kernel AND the user
+// wants it" — so disabling ESIMD via the env var preserves the
+// pre-existing DMMV behavior bit-identically.
+inline bool ggml_sycl_esimd_preempts_dmmv(enum ggml_type type) {
+#ifdef GGML_SYCL_ESIMD
+    extern bool esimd_enabled_for(const char * quant_name);
+    switch (type) {
+        case GGML_TYPE_Q4_1: return esimd_enabled_for("q4_1");
+        case GGML_TYPE_Q5_0: return esimd_enabled_for("q5_0");
+        case GGML_TYPE_Q5_1: return esimd_enabled_for("q5_1");
+        case GGML_TYPE_Q2_K: return esimd_enabled_for("q2_k");
+        case GGML_TYPE_Q3_K: return esimd_enabled_for("q3_k");
+        case GGML_TYPE_Q5_K: return esimd_enabled_for("q5_k");
+        default: return false;
+    }
+#else
+    (void) type;
+    return false;
+#endif
+}
+
 static bool ggml_sycl_supports_dmmv(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -3710,8 +3740,18 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // is enabled takes precedence over DMMV, the current if-else implementation
     // requires disabling DMMV if both conditions are met
 
-    if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) &&
-                                          ggml_sycl_supports_reorder_mmvq(src0->type)))) {
+    // Two reasons to give mmvq precedence over dmmv:
+    //   1. The tensor's quant type supports the reorder-mmvq optimization
+    //      and the reorder eligibility check passes.
+    //   2. The tensor's quant type has an ESIMD kernel in mmvq.cpp that the
+    //      user has opted into. Without this, the 6 raw-block quants'
+    //      ESIMD code paths (Q5_K, Q5_0, Q5_1, Q4_1, Q3_K, Q2_K) are
+    //      unreachable — DMMV claims them first.
+    const bool prefer_mmvq =
+        (should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type))
+        || ggml_sycl_esimd_preempts_dmmv(src0->type);
+
+    if (!g_ggml_sycl_prioritize_dmmv && prefer_mmvq) {
       // Arc770 get benefit with Q4_0 by skipping it.
       if (!(ggml_sycl_info().devices[ctx.device].hw_info.arch ==
                 gpu_arch::intel_gpu_acm_g10 &&

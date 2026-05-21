@@ -1713,3 +1713,96 @@ mcp__scheduled-tasks__update_scheduled_task with enabled: false")
 now triggers. After this commit lands and is verified, the schedule
 will be disabled.
 
+
+## 2026-05-21T  Corrigendum — campaign bench numbers for 6 of 10 quants were measurement artifacts
+
+While preparing the per-quant opt-in env-var refactor for `mmvq.cpp`,
+GGML_SYCL_DEBUG tracing surfaced that the ESIMD code paths for 6 of
+the 10 wired quants are **unreachable in default dispatch**:
+
+- Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q5_K all dispatch through
+  `ggml_sycl_op_dequantize_mul_mat_vec` (DMMV), not `mmvq.cpp`.
+- The dispatch precedence in `ggml_sycl_mul_mat()` only promotes a
+  quant from DMMV to MMVQ if `ggml_sycl_supports_reorder_mmvq()`
+  returns true for it. That helper covers only
+  {Q4_0, Q8_0, Q4_K, Q6_K}.
+- Setting `GGML_SYCL_USE_ESIMD=1` does **not** override this
+  precedence. For the 6 non-reorder-mmvq quants, the env var had
+  zero effect: paired vanilla vs ESIMD bench runs both executed the
+  DMMV path on those 6 quants' tensors. The only ESIMD code that
+  actually fired in those benches was on Q4_K / Q6_K tensors mixed
+  into K-quant `_M` variants by the gguf format's importance
+  heuristic.
+
+### Implication for prior bench numbers
+
+The following 5 entries in this LOG and `SYCL_ESIMD_PERF.md` were
+**measurement artifacts**, not real ESIMD-vs-vanilla comparisons:
+
+| quant | claimed ratio | true ratio (mmvq-ESIMD vs DMMV) |
+|---|--:|--:|
+| Q5_1 | 1.01× ("first ESIMD win") | **0.90×** |
+| Q5_0 | 0.98× | **0.79×** |
+| Q4_1 | 0.93× | **0.79×** |
+| Q2_K | 0.88× | **0.80×** |
+| Q3_K | 0.66× | **0.70×** |
+| Q5_K (Phase C) | 0.86× | **0.79×** |
+
+The previous "1.01× ESIMD wins on Q5_1" claim is **withdrawn**.
+None of the 10 ESIMD kernels in this fork beat the SYCL standard
+path on Xe-LPG.
+
+### The 4 reorder-quants (Q4_0, Q8_0, Q4_K, Q6_K)
+
+Ratios for these are valid as-recorded (0.32× / 0.43× / 0.55× /
+0.40×) — they were always compared against the same-path
+`reorder_mul_mat_vec_q*_q8_1_sycl` baseline since both code paths
+go through mmvq.
+
+### What changed in this commit
+
+1. **Dispatch fix** (`ggml-sycl.cpp`): added
+   `ggml_sycl_esimd_preempts_dmmv()` that promotes a quant from
+   DMMV to MMVQ *when the user has explicitly opted into ESIMD for
+   that quant via the env var*. This makes the previously-dead
+   ESIMD code paths reachable. Default behavior (env var unset) is
+   bit-identical to before.
+
+2. **Per-quant opt-in** (`mmvq.cpp`):
+   `GGML_SYCL_USE_ESIMD` accepts not just `1`/`all` but a comma
+   list of quant names (`q5_1,q5_0,q2_k`) for selective enable.
+   The implicit "all" semantics are preserved when set to `1` or
+   `all` or `true`. An `auto` mode was scaffolded but currently
+   enables NOTHING because no kernel meets parity — documented
+   inline.
+
+3. **Corrected `SYCL_ESIMD_PERF.md`** with the true ratios from a
+   GGML_SYCL_DEBUG-verified bench.
+
+### Methodological lesson
+
+Future contributors extending ESIMD coverage:
+- **Always verify ESIMD dispatch with `GGML_SYCL_DEBUG=1` before
+  trusting bench numbers.** Look for `Calling
+  mul_mat_vec_<quant>_q8_1_sycl_esimd` lines from the dispatch
+  site. If the trace shows
+  `ggml_sycl_op_dequantize_mul_mat_vec/to_fp16_sycl` for tensors
+  of your target quant, ESIMD didn't run — DMMV did.
+- The mixed-quant `_M` GGUF variants (Q3_K_M, Q2_K, etc.) embed
+  Q4_K / Q5_K / Q6_K tensors. A bench on a `_M` model exercises
+  multiple dispatch paths simultaneously.
+
+### Disposition
+
+The 5 raw-block ESIMD kernels added in this session (Q3_K, Q2_K,
+Q4_1, Q5_0, Q5_1) are **kept** in the tree:
+- Math is correct (audit-passing in the style of `3d9162d`).
+- They serve as a starting point for future work on closing the
+  ESIMD-vs-DMMV gap for these quants.
+- The dispatch fix makes them reachable for measurement.
+- Documentation (this corrigendum + updated PERF table) marks them
+  as **not recommended for production use** until the gap closes.
+
+The recommended path forward for closing the gap is documented at
+the end of this LOG.
+
