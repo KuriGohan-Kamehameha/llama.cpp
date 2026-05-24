@@ -403,6 +403,7 @@ paired runs, one quant per scheduled-task firing.
 |---|---|--:|--:|--:|--|
 | Q4_0 | dolphin3 8B (requantized from Q4_K_M) | **10.0751 ± 0.25623** | **10.0751 ± 0.25623** | 0.0000 / 0.000% | `e3d40908…` (identical) |
 | Q5_K | TinyLlama 1.1B Q5_K_M | **18.6953 ± 0.56406** | **18.6953 ± 0.56406** | 0.0000 / 0.000% | `2d2f2781…` (identical) |
+| Q6_K | TinyLlama 1.1B Q6_K | **18.5573 ± 0.55867** | **18.5573 ± 0.55867** | 0.0000 / 0.000% | `bdfc2d9f…` (identical) |
 
 Q4_0 verification (2026-05-10): 2 vanilla + 2 ESIMD runs on wikitext-2
 test split, 50 chunks × 512 tokens = 25,600 tokens scored,
@@ -432,6 +433,29 @@ the Q4_0 / Q4_K rows. All 4 runs printed `Final estimate: PPL =
 GPU uncontended at bench time (no concurrent llama/ollama workers).
 Same identical-stream result as the Q4_K_M and Q4_0 precedents — Q5_K
 ESIMD path is bit-for-bit equivalent to standard SYCL on this model.
+
+Q6_K verification (2026-05-24): 2 vanilla + 2 ESIMD runs on wikitext-2
+test split, 50 chunks × 512 tokens = 25,600 tokens scored,
+`llama-perplexity -ngl 999 -fa off`, TinyLlama 1.1B Q6_K
+(`tinyllama:1.1b-chat-v1-q6_K` ollama blob,
+sha256 `4928c406d5e3299653d2170884113363aef4491d9b9d5c93ea73ec09f7e69495`).
+Binary rebuilt at fork commit `7f16574` (dispatch fix + per-quant
+opt-in) before the run, so the bench exercises the current source —
+Q6_K was already reachable in default dispatch pre-7f16574 (it is in
+the `ggml_sycl_supports_reorder_mmvq()` set), so the corrigendum's
+disclaimers for the 6 previously-dead quants do not apply here. All
+4 runs printed `Final estimate: PPL = 18.5573 +/- 0.55867` and
+produced byte-identical per-chunk PPL value streams (sha256
+`bdfc2d9f75c097db741ae081bd9f80cf0d6491f0cfddfa70647ae2cd6ddede58`
+across all 4 runs, extracted with `grep -oE '\[[0-9]+\][0-9]+\.[0-9]+'`
+to strip an interleaved `get_memory_info: ext_intel_free_memory is not
+supported` stderr warning that broke a single line on one run — the
+underlying chunk values are unaffected). Single ollama `ollama-lib
+runner` resident in GPU memory at 0.5% CPU and 0% GPU memory
+contention (perplexity is correctness-only; throughput contention
+irrelevant). Same identical-stream result as the Q4_K_M / Q4_0 / Q5_K
+precedents — Q6_K ESIMD path is bit-for-bit equivalent to standard
+SYCL on this model.
 
 ## Scope
 
