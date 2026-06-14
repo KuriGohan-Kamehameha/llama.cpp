@@ -405,6 +405,11 @@ paired runs, one quant per scheduled-task firing.
 | Q5_K | TinyLlama 1.1B Q5_K_M | **18.6953 ± 0.56406** | **18.6953 ± 0.56406** | 0.0000 / 0.000% | `2d2f2781…` (identical) |
 | Q6_K | TinyLlama 1.1B Q6_K | **18.5573 ± 0.55867** | **18.5573 ± 0.55867** | 0.0000 / 0.000% | `bdfc2d9f…` (identical) |
 | Q8_0 | TinyLlama 1.1B (requantized from Q6_K) | **18.5527 ± 0.55849** | **18.5527 ± 0.55849** | 0.0000 / 0.000% | `7ebb8026…` (identical) |
+| Q2_K | TinyLlama 1.1B (requantized from Q6_K) | **26.4039 ± 0.77512** | **26.4039 ± 0.77512** | 0.0000 / 0.000% | `8173d975…` (identical) |
+| Q3_K | TinyLlama 1.1B (requantized from Q6_K) | **20.1407 ± 0.59797** | **20.1407 ± 0.59797** | 0.0000 / 0.000% | `45eca5e4…` (identical) |
+| Q4_1 | TinyLlama 1.1B (requantized from Q6_K) | **19.3334 ± 0.57657** | **19.3334 ± 0.57657** | 0.0000 / 0.000% | `926274aa…` (identical) |
+| Q5_0 | TinyLlama 1.1B (requantized from Q6_K) | **18.6669 ± 0.56012** | **18.6669 ± 0.56012** | 0.0000 / 0.000% | `13905582…` (identical) |
+| Q5_1 | TinyLlama 1.1B (requantized from Q6_K) | **18.8097 ± 0.56610** | **18.8097 ± 0.56610** | 0.0000 / 0.000% | `0ff5961f…` (identical) |
 
 Q4_0 verification (2026-05-10): 2 vanilla + 2 ESIMD runs on wikitext-2
 test split, 50 chunks × 512 tokens = 25,600 tokens scored,
@@ -490,6 +495,53 @@ Q6_K precedents — Q8_0 ESIMD path is bit-for-bit equivalent to standard
 SYCL on this model. Q8_0 completes the original 5-quant core roster
 (Q4_K, Q4_0, Q5_K, Q6_K, Q8_0); the extension quants (Q2_K, Q3_K,
 Q4_1, Q5_0, Q5_1) remain as follow-ups.
+
+Q2_K / Q3_K / Q4_1 / Q5_0 / Q5_1 verification (2026-06-14): the five
+extension quants, verified in one batch — 2 vanilla + 2 ESIMD runs each
+on wikitext-2 test split, 50 chunks × 512 = 25,600 tokens scored,
+`llama-perplexity -ngl 999 -fa off`. Each model was requantized from the
+TinyLlama 1.1B Q6_K ollama blob (`4928c406…`) with
+`llama-quantize --allow-requantize`; absolute ppl is loss-stacked (the
+Q6_K floor plus the target quant's own loss) and is NOT cross-comparable
+between rows, but the kernel-equivalence signal is model-independent.
+Each kernel was isolated with `GGML_SYCL_USE_ESIMD=<quant>` and a
+`GGML_SYCL_DEBUG=1` pre-check confirmed dispatch before the paired runs.
+
+**These five differ from the reorder-quant rows (Q4_0 / Q8_0 / Q4_K /
+Q6_K) in a way that makes them a *stronger* correctness probe.** Their
+default (env-unset) mat-vec path is DMMV (dequantize-then-FP16 mat-vec),
+whereas enabling ESIMD reroutes the mat-vec to the int8
+`mul_mat_vec_<quant>_q8_1_sycl_esimd` kernel via the
+`ggml_sycl_esimd_preempts_dmmv()` dispatch hook. So this gate compares
+two **different numerical algorithms** (DMMV vs int8 mmvq), not two
+builds of the same kernel as the reorder rows do. The ESIMD kernel was
+also heavily exercised — 174 mat-vec calls/chunk for the K-quants
+(Q2_K, Q3_K) and 305/chunk for the legacy quants (Q4_1, Q5_0, Q5_1),
+versus ~4/chunk for the reorder quants. Despite the algorithm difference
+and the heavy exercise, all four runs per quant produced byte-identical
+per-chunk PPL value streams and an identical final estimate; Δppl =
+0.0000 / 0.000% for every quant:
+
+| quant | ppl (all 4 runs) | model sha256 | per-chunk stream sha256 |
+|---|--:|--|--|
+| Q2_K | 26.4039 ± 0.77512 | `6f197db0234e1ef7…` | `8173d975d10f2e59fe5a5f3591c44afca037fdd6a57b070875ac0d3602574255` |
+| Q3_K | 20.1407 ± 0.59797 | `20aefffacce57ac2…` | `45eca5e42cf9f3c67ccce1a126d7b6bc9cb0368f7e853afe47ff9057a823b1a8` |
+| Q4_1 | 19.3334 ± 0.57657 | `2009be6ca2fb6e8c…` | `926274aaf2d069aa506a821ee21711d0d8871a9a5116d4b3ec8cfdf852cad4c8` |
+| Q5_0 | 18.6669 ± 0.56012 | `958d8585a9c2d650…` | `139055821d433d4f0ea79c84c1f80fbc9a661a1d347a98fd7793a99375cbff09` |
+| Q5_1 | 18.8097 ± 0.56610 | `e82436d688ec46b8…` | `0ff5961f3de26f86e1cfe02941989100fa3fe33c7060e6fc23d475d715fa8fde` |
+
+GPU compute was idle at run start (intel_gpu_top RC6 100%, all engines
+0.00%); the five quants ran sequentially with no cross-quant GPU
+overlap. Same identical-stream result as the Q4_K_M / Q4_0 / Q5_K /
+Q6_K / Q8_0 precedents.
+
+**Roster complete (2026-06-14).** All 10 ESIMD-wired quants — Q4_K,
+Q4_0, Q5_K, Q6_K, Q8_0, Q2_K, Q3_K, Q4_1, Q5_0, Q5_1 — now have
+perplexity rows and are bit-for-bit equivalent to their respective
+standard SYCL paths on Xe-LPG. This is a **correctness** result only:
+all 10 ESIMD kernels remain slower than vanilla on this hardware (0.32×–
+0.90×; see the perf table above). The env-var gate makes A/B trivial,
+but there is no throughput reason to enable ESIMD on Xe-LPG today.
 
 ## Scope
 
