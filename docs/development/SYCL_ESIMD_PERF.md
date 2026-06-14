@@ -404,6 +404,7 @@ paired runs, one quant per scheduled-task firing.
 | Q4_0 | dolphin3 8B (requantized from Q4_K_M) | **10.0751 ± 0.25623** | **10.0751 ± 0.25623** | 0.0000 / 0.000% | `e3d40908…` (identical) |
 | Q5_K | TinyLlama 1.1B Q5_K_M | **18.6953 ± 0.56406** | **18.6953 ± 0.56406** | 0.0000 / 0.000% | `2d2f2781…` (identical) |
 | Q6_K | TinyLlama 1.1B Q6_K | **18.5573 ± 0.55867** | **18.5573 ± 0.55867** | 0.0000 / 0.000% | `bdfc2d9f…` (identical) |
+| Q8_0 | TinyLlama 1.1B (requantized from Q6_K) | **18.5527 ± 0.55849** | **18.5527 ± 0.55849** | 0.0000 / 0.000% | `7ebb8026…` (identical) |
 
 Q4_0 verification (2026-05-10): 2 vanilla + 2 ESIMD runs on wikitext-2
 test split, 50 chunks × 512 tokens = 25,600 tokens scored,
@@ -456,6 +457,39 @@ contention (perplexity is correctness-only; throughput contention
 irrelevant). Same identical-stream result as the Q4_K_M / Q4_0 / Q5_K
 precedents — Q6_K ESIMD path is bit-for-bit equivalent to standard
 SYCL on this model.
+
+Q8_0 verification (2026-06-14): 2 vanilla + 2 ESIMD runs on wikitext-2
+test split, 50 chunks × 512 tokens = 25,600 tokens scored,
+`llama-perplexity -ngl 999 -fa off`, TinyLlama 1.1B Q8_0. No genuine
+Q8_0 GGUF was on disk, so the model was requantized from the TinyLlama
+1.1B Q6_K ollama blob (sha256 `4928c406…`, the highest-precision
+TinyLlama on disk) with `llama-quantize --allow-requantize … Q8_0`
+(output sha256
+`5acd4ee2cebdb7a2550b43d8873c272fb720f6ba3768f811483fc59843bd1f71`,
+1114.91 MiB / 8.50 BPW). Q8_0 is wider than the Q6_K source, so this is
+an up-quant: the Q6_K loss dominates and Q8_0 adds essentially none,
+which is why the absolute ppl (18.5527) lands right beside the Q6_K row
+(18.5573). The absolute number is therefore NOT comparable to the
+Q4_0 / Q4_K dolphin3 rows — but the kernel-equivalence signal (paired
+identical streams) is model-independent. ESIMD was isolated with
+`GGML_SYCL_USE_ESIMD=q8_0` (per-quant opt-in, not the all-on `=1`), so
+only the Q8_0 kernel was under test; a `GGML_SYCL_DEBUG=1` pre-check
+confirmed `reorder_mul_mat_vec_q8_0_q8_1_sycl_esimd` was actually
+invoked (4 calls/chunk) and no other ESIMD kernel fired. All weight
+tensors have ne00 ∈ {2048, 5632}, both multiples of QK8_0·8 = 256, so
+the ESIMD block-count guard (`ne00 % (QK8_0*8) == 0`) admits every
+tensor. All 4 runs printed `Final estimate: PPL = 18.5527 +/- 0.55849`
+and produced byte-identical per-chunk PPL value streams (sha256
+`7ebb8026278e440a7498fc2163aa71c00ae914244164ef558670e85e637581a4`
+across all 4 runs). Bench env had an idle gpt-oss-abliterated:20b
+llama-server plus an idle piranesi-msabl ollama runner resident; GPU
+compute was idle at run start (intel_gpu_top RC6 100%, all engines
+0.00%), and perplexity is a correctness metric unaffected by throughput
+contention. Same identical-stream result as the Q4_K_M / Q4_0 / Q5_K /
+Q6_K precedents — Q8_0 ESIMD path is bit-for-bit equivalent to standard
+SYCL on this model. Q8_0 completes the original 5-quant core roster
+(Q4_K, Q4_0, Q5_K, Q6_K, Q8_0); the extension quants (Q2_K, Q3_K,
+Q4_1, Q5_0, Q5_1) remain as follow-ups.
 
 ## Scope
 
