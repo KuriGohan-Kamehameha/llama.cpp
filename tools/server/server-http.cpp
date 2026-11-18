@@ -1,6 +1,7 @@
 #include "common.h"
 #include "http.h"
 #include "server-http.h"
+#include "server-drain.h"
 #include "server-common.h"
 #include "ui.h"
 
@@ -19,6 +20,7 @@
 
 class server_http_context::Impl {
 public:
+    std::shared_ptr<server_drain> drain = std::make_shared<server_drain>();
     std::vector<std::unique_ptr<httplib::Server>> servers;
     std::vector<std::string> hosts;
     std::vector<std::thread> threads; // one thread per listener
@@ -361,6 +363,11 @@ bool server_http_context::init_listener(const common_params & params) {
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
+    srv->Get(path_prefix + "/_internal/drain", [gate = pimpl->drain](const httplib::Request &, httplib::Response & res) {
+        const auto st = gate->snapshot();
+        res.set_content(json{{"configured", st.configured}, {"draining", st.draining}, {"active", st.active}}.dump(), "application/json");
+    });
+
     srv->new_task_queue = [this] {
         return new server_http_task_queue(*pimpl->pool);
     };
@@ -633,7 +640,7 @@ static std::string build_query_string(const httplib::Request & req) {
 // using unique_ptr for request to allow safe capturing in lambdas
 using server_http_req_ptr = std::unique_ptr<server_http_req>;
 
-static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
+static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res, std::shared_ptr<server_drain::lease> lease) {
     if (response->is_stream()) {
         res.status = response->status;
         // Tell Nginx to not buffer any streamed response
@@ -659,7 +666,8 @@ static void process_handler_response(server_http_req_ptr && request, server_http
             }
             return has_next;
         };
-        const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
+        const auto on_complete = [request = q_ptr, response = r_ptr, lease](bool) mutable {
+            (void) lease;
             response->on_complete();
             response.reset();
             request.reset();
@@ -668,14 +676,26 @@ static void process_handler_response(server_http_req_ptr && request, server_http
     } else {
         res.status = response->status;
         set_headers(res, response->headers);
-        res.set_content(response->data, response->content_type);
+        if (lease) {
+            auto data = std::make_shared<std::string>(response->data);
+            res.set_content_provider(data->size(), response->content_type,
+                [data](size_t offset, size_t length, httplib::DataSink & sink) {
+                    if (offset > data->size() || length > data->size() - offset) return false;
+                    return sink.write(data->data() + offset, length);
+                }, [lease](bool) { (void) lease; });
+        } else {
+            res.set_content(response->data, response->content_type);
+        }
         response->on_complete();
     }
 }
 
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto callback = [handler, gate = pimpl->drain, path](const httplib::Request & req, httplib::Response & res) {
+        const bool monitor = path == "/health" || path == "/v1/health" || path == "/slots";
+        auto lease = monitor ? std::shared_ptr<server_drain::lease>() : gate->acquire();
+        if (!monitor && !lease) { res.status = 503; res.set_content("draining", "text/plain"); return; }
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -686,7 +706,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(lease));
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {
@@ -696,7 +716,9 @@ void server_http_context::get(const std::string & path, const server_http_contex
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto callback = [handler, gate = pimpl->drain](const httplib::Request & req, httplib::Response & res) {
+        auto lease = gate->acquire();
+        if (!lease) { res.status = 503; res.set_content("draining", "text/plain"); return; }
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -737,7 +759,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(lease));
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {
@@ -748,7 +770,9 @@ void server_http_context::post(const std::string & path, const server_http_conte
 void server_http_context::ws(const std::string & path, const server_http_context::ws_handler_t & handler) const {
     const std::string full_path = path_prefix + path;
 
-    auto callback = [handler](const httplib::Request & req, httplib::ws::WebSocket & sock) {
+    auto callback = [handler, gate = pimpl->drain](const httplib::Request & req, httplib::ws::WebSocket & sock) {
+        auto lease = gate->acquire();
+        if (!lease) { sock.close(); return; }
         struct conn_impl : server_http_context::ws_conn {
             httplib::ws::WebSocket & sock;
             std::mutex mutex_send;
@@ -797,7 +821,9 @@ void server_http_context::ws(const std::string & path, const server_http_context
 
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
+    auto callback = [handler, gate = pimpl->drain](const httplib::Request & req, httplib::Response & res) {
+        auto lease = gate->acquire();
+        if (!lease) { res.status = 503; res.set_content("draining", "text/plain"); return; }
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -808,7 +834,7 @@ void server_http_context::del(const std::string & path, const server_http_contex
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
-        process_handler_response(std::move(request), response, res);
+        process_handler_response(std::move(request), response, res, std::move(lease));
     };
     const std::string full_path = path_prefix + path;
     for (const auto & srv : pimpl->servers) {

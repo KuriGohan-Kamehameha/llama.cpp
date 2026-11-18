@@ -7,9 +7,11 @@ name: Windows ROCm upstream catch-up candidate
 on:
   workflow_dispatch:
   push:
-    branches: [build/qpc-windows-rocm-candidate]
+    branches: [build/request-drain-rocm]
     paths:
       - .github/workflows/windows-rocm-candidate.yml
+      - tools/server/server-http.cpp
+      - tools/server/server-drain.h
       - ggml/src/ggml.c
       - ggml/src/ggml-time.h
       - integrations/llmster/build-windows-server.ps1
@@ -20,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-rocm-upstream-catchup-candidate
+  group: windows-rocm-request-drain-candidate
   cancel-in-progress: false
 
 jobs:
@@ -65,6 +67,16 @@ jobs:
           & 'C:\TheRock\build\.venv\Scripts\python.exe' -B ./integrations/llmster/test_package_windows_server.py
           if ($LASTEXITCODE -ne 0) { throw 'Packaging regressions failed.' }
           & ./integrations/llmster/build-windows-server.ps1 -Source ./source -Output ./candidate -Evidence ./evidence -Jobs 2
+      - name: Exercise server drain with tiny CPU model
+        shell: pwsh
+        run: |
+          $python = 'C:\TheRock\build\.venv\Scripts\python.exe'
+          $model = Join-Path $env:RUNNER_TEMP 'stories15M.gguf'
+          $uri = 'https://huggingface.co/ggml-org/models/resolve/499bc8821c6b12b4e53c5bffcb21ec206f212d81/tinyllamas/stories15M.gguf'
+          Invoke-WebRequest -Uri $uri -OutFile $model
+          if ((Get-FileHash -Algorithm SHA256 $model).Hash -ne '61B50D457809A5194818FD22E6724B456CD7BB9A6264C52C8110684C53F3704A') { throw 'Tiny model checksum mismatch.' }
+          & $python ./source/tests/test-server-drain-http.py ./candidate/bin/llama-server.exe $model
+          if ($LASTEXITCODE -ne 0) { throw 'Request drain integration failed.' }
       - name: Upload candidate and build evidence
         if: always()
         uses: actions/upload-artifact@v6
