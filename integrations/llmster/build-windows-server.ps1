@@ -77,6 +77,7 @@ $configure = @(
     '-DLLAMA_OPENSSL=OFF',
     '-DLLAMA_BUILD_SERVER=ON',
     '-DLLAMA_BUILD_UI=OFF',
+    '-DLLAMA_USE_PREBUILT_UI=OFF',
     '-DLLAMA_BUILD_TESTS=ON'
 )
 Invoke-Checked cmake $configure
